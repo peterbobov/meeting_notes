@@ -1,0 +1,27 @@
+[API]
+# OpenAI API key will be loaded from .env file
+# No need to set it here - use environment variable OPENAI_API_KEY
+
+[PATHS]
+# Input folder to monitor for Plaud recordings
+# Use ${PLAUD_RECORDINGS_PATH} to reference environment variable
+input_folder = ${PLAUD_RECORDINGS_PATH}
+output_folder = ./meeting_data
+processed_folder = ./processed_audio
+logs_folder = ./logs
+
+[SETTINGS]
+auto_process = true
+speaker_detection = true
+max_file_size_mb = 500
+supported_formats = mp3,wav,m4a,aac
+processing_timeout_minutes = 30
+
+[PROMPTS]
+summary_prompt = You are a meeting assistant. Analyze this transcript and create a concise summary focusing on key decisions, main topics discussed, and important insights. Format as markdown with clear sections for Key Points, Decisions Made, and Next Steps. IMPORTANT: Write your response in the same language as the transcript.
+
+action_items_prompt = Extract action items from this meeting transcript. For each action item, identify: 1) The specific task, 2) Who should do it (if mentioned), 3) Any deadlines or timeframes mentioned. Organize by priority (High, Medium, Low) and format as markdown with checkboxes. If no assignee is mentioned, use "Unassigned". Include context details when helpful. IMPORTANT: Write your response in the same language as the transcript.
+
+title_generation_prompt = Based on this meeting transcript, generate a concise, descriptive meeting title (max 6 words) that captures the main topic or purpose of the meeting.
+
+participant_detection_prompt = Identify all participants mentioned in this meeting transcript. Look for names, roles, or speaker identifications. Return as a comma-separated list.
