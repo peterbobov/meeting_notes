@@ -274,14 +274,20 @@ class AIProcessor:
     def __init__(self, api_key: str):
         self.client = OpenAI(api_key=api_key)
         
-    def generate_summary(self, transcript: str, prompt: str) -> str:
+    def generate_summary(self, transcript: str, prompt: str, context: Optional[str] = None) -> str:
         """Generate meeting summary using GPT-4o."""
         try:
+            # Create the user message with optional context
+            user_message = "Please analyze this meeting transcript and create a summary:"
+            if context:
+                user_message = f"Context: {context}\n\nPlease analyze this meeting transcript and create a summary based on the provided context:"
+            user_message += f"\n\n{transcript}"
+            
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"Please analyze this meeting transcript and create a summary:\n\n{transcript}"}
+                    {"role": "user", "content": user_message}
                 ],
                 max_tokens=1000,
                 temperature=0.3
@@ -369,8 +375,18 @@ class ObsidianGenerator:
         
         return folder_path
         
-    def generate_meta_file(self, meeting_data: Dict) -> str:
+    def generate_meta_file(self, meeting_data: Dict, include_action_items: bool = True) -> str:
         """Generate meeting_meta.md content."""
+        navigation_links = [
+            "- [[2_meeting_transcript]] - Full transcript with timestamps",
+            "- [[3_meeting_summary]] - Key points and decisions"
+        ]
+        
+        if include_action_items:
+            navigation_links.append("- [[4_meeting_action_items]] - Tasks and follow-ups")
+        
+        navigation_section = "\n".join(navigation_links)
+        
         template = f"""# Meeting: {meeting_data['title']}
 
 **Date:** {meeting_data['date']}
@@ -380,17 +396,14 @@ class ObsidianGenerator:
 **Status:** #meeting/processed
 
 ## Quick Navigation
-- [[2_meeting_transcript]] - Full transcript with timestamps
-- [[3_meeting_summary]] - Key points and decisions
-- [[4_meeting_action_items]] - Tasks and follow-ups
+{navigation_section}
 
 ## Meeting Overview
 {meeting_data.get('overview', 'Auto-generated meeting recording processed for analysis and action item tracking.')}
 
 ---
 *Processed on: {meeting_data['processed_timestamp']}*
-*Audio file: {meeting_data['original_filename']}*
-"""
+*Audio file: {meeting_data['original_filename']}*"""
         return template
         
     def generate_transcript_file(self, transcript_data: Dict) -> str:
@@ -438,14 +451,17 @@ class ObsidianGenerator:
 """
         return template
         
-    def write_files(self, folder_path: Path, file_contents: Dict):
+    def write_files(self, folder_path: Path, file_contents: Dict, write_action_items: bool = True):
         """Write all markdown files to the meeting folder."""
         files_to_write = {
             '1_meeting_meta.md': file_contents['meta'],
             '2_meeting_transcript.md': file_contents['transcript'],
-            '3_meeting_summary.md': file_contents['summary'],
-            '4_meeting_action_items.md': file_contents['action_items']
+            '3_meeting_summary.md': file_contents['summary']
         }
+        
+        # Only include action items file if requested
+        if write_action_items and 'action_items' in file_contents:
+            files_to_write['4_meeting_action_items.md'] = file_contents['action_items']
         
         for filename, content in files_to_write.items():
             file_path = folder_path / filename
@@ -458,9 +474,12 @@ class ObsidianGenerator:
 class PlaudProcessor:
     """Main processor pipeline for Plaud Pin recordings."""
     
-    def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None):
+    def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None, \
+                 context: Optional[str] = None, generate_action_items: bool = True):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
+        self.context = context
+        self.generate_action_items = generate_action_items
         self.setup_logging()
         
         # Initialize components
@@ -570,13 +589,18 @@ class PlaudProcessor:
             summary_prompt = self.custom_summary_prompt if self.custom_summary_prompt else prompts['summary_prompt']
             summary = self.ai_processor.generate_summary(
                 transcript_data['text'], 
-                summary_prompt
+                summary_prompt,
+                self.context
             )
             
-            action_items = self.ai_processor.extract_action_items(
-                transcript_data['text'], 
-                prompts['action_items_prompt']
-            )
+            # Only generate action items if requested
+            if self.generate_action_items:
+                action_items = self.ai_processor.extract_action_items(
+                    transcript_data['text'], 
+                    prompts['action_items_prompt']
+                )
+            else:
+                action_items = "Action items generation disabled for this meeting."
             
             participants = self.ai_processor.detect_participants(
                 transcript_data['text'], 
@@ -624,14 +648,17 @@ class PlaudProcessor:
             
             # Generate file contents
             files_content = {
-                'meta': self.obsidian_generator.generate_meta_file(meeting_data),
+                'meta': self.obsidian_generator.generate_meta_file(meeting_data, self.generate_action_items),
                 'transcript': self.obsidian_generator.generate_transcript_file(transcript_file_data),
-                'summary': self.obsidian_generator.generate_summary_file(summary_file_data),
-                'action_items': self.obsidian_generator.generate_action_items_file(action_items_file_data)
+                'summary': self.obsidian_generator.generate_summary_file(summary_file_data)
             }
             
+            # Only include action items in files_content if they're being generated
+            if self.generate_action_items:
+                files_content['action_items'] = self.obsidian_generator.generate_action_items_file(action_items_file_data)
+            
             # Write files
-            self.obsidian_generator.write_files(meeting_folder, files_content)
+            self.obsidian_generator.write_files(meeting_folder, files_content, self.generate_action_items)
             
             # Move processed file
             processed_path = self.audio_processor.move_to_processed(file_path)
@@ -680,6 +707,8 @@ if __name__ == "__main__":
     parser.add_argument('--monitor', action='store_true', help='Monitor folder for new files')
     parser.add_argument('--config', default='config.ini', help='Config file path')
     parser.add_argument('--custom-prompt', help='Custom prompt for meeting summarization')
+    parser.add_argument('--context', help='Context about the meeting to guide summarization')
+    parser.add_argument('--no-action-items', action='store_true', help='Disable action items generation')
     
     args = parser.parse_args()
     
@@ -687,7 +716,12 @@ if __name__ == "__main__":
     print("=" * 40)
     
     try:
-        processor = PlaudProcessor(args.config, getattr(args, 'custom_prompt', None))
+        processor = PlaudProcessor(
+            config_path=args.config,
+            custom_summary_prompt=getattr(args, 'custom_prompt', None),
+            context=getattr(args, 'context', None),
+            generate_action_items=not args.no_action_items
+        )
         
         if args.file:
             if Path(args.file).exists():

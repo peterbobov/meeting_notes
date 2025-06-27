@@ -2,7 +2,6 @@
 .env
 config.ini
 *.ini
-CLAUDE.md
 
 # API keys and secrets
 *.key
