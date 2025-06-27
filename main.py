@@ -27,6 +27,9 @@ from openai import OpenAI
 # Local transcription
 from local_transcription import LocalTranscriptionService, TranscriptionResult
 
+# whisper.cpp backend
+from whisper_cpp_backend import WhisperCppService
+
 # Environment
 from dotenv import load_dotenv
 
@@ -128,16 +131,16 @@ class HybridTranscriptionService:
         self.local_model = local_model
         
         if use_local:
-            self.local_service = LocalTranscriptionService(
-                model_size=local_model,
-                enable_optimizations=True
+            # Use whisper.cpp backend for better M2 compatibility
+            self.local_service = WhisperCppService(
+                model_size=local_model
             )
-            logging.info(f"Initialized local transcription with model '{local_model}'")
+            logging.info(f"Initialized whisper.cpp transcription with model '{local_model}'") 
         else:
             self.client = OpenAI(api_key=api_key)
             logging.info("Initialized OpenAI API transcription service")
         
-    def transcribe_audio(self, file_path: str) -> Dict:
+    def transcribe_audio(self, file_path: str, language: Optional[str] = None) -> Dict:
         """
         Transcribe audio using either local Whisper or OpenAI API.
         Returns: {
@@ -149,14 +152,14 @@ class HybridTranscriptionService:
         }
         """
         if self.use_local:
-            return self._transcribe_local(file_path)
+            return self._transcribe_local(file_path, language)
         else:
-            return self._transcribe_api(file_path)
+            return self._transcribe_api(file_path, language)
     
-    def _transcribe_local(self, file_path: str) -> Dict:
+    def _transcribe_local(self, file_path: str, language: Optional[str] = None) -> Dict:
         """Transcribe using local Whisper model."""
         try:
-            result = self.local_service.transcribe_audio(file_path)
+            result = self.local_service.transcribe_audio(file_path, language)
             
             # Convert TranscriptionResult to expected format
             return {
@@ -178,7 +181,7 @@ class HybridTranscriptionService:
             # Fallback to API if local fails
             if hasattr(self, 'api_key'):
                 logging.info("Falling back to OpenAI API...")
-                return self._transcribe_api(file_path)
+                return self._transcribe_api(file_path, language)
             else:
                 return {
                     'text': '',
@@ -189,20 +192,27 @@ class HybridTranscriptionService:
                     'processing_info': {'method': 'local_whisper_failed'}
                 }
     
-    def _transcribe_api(self, file_path: str) -> Dict:
+    def _transcribe_api(self, file_path: str, language: Optional[str] = None) -> Dict:
         """Transcribe using OpenAI Whisper API."""
         try:
             if not hasattr(self, 'client'):
                 self.client = OpenAI(api_key=self.api_key)
                 
             with open(file_path, "rb") as audio_file:
+                # Build transcription parameters
+                transcribe_params = {
+                    "model": "whisper-1",
+                    "file": audio_file,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities": ["segment"]
+                }
+                
+                # Add language if specified
+                if language:
+                    transcribe_params["language"] = language
+                    
                 # Transcribe with timestamps
-                transcript = self.client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"]
-                )
+                transcript = self.client.audio.transcriptions.create(**transcribe_params)
                 
             return {
                 'text': transcript.text,
@@ -274,13 +284,15 @@ class AIProcessor:
     def __init__(self, api_key: str):
         self.client = OpenAI(api_key=api_key)
         
-    def generate_summary(self, transcript: str, prompt: str, context: Optional[str] = None) -> str:
+    def generate_summary(self, transcript: str, prompt: str, context: Optional[str] = None, target_language: Optional[str] = None) -> str:
         """Generate meeting summary using GPT-4o."""
         try:
-            # Create the user message with optional context
+            # Create the user message with optional context and language specification
             user_message = "Please analyze this meeting transcript and create a summary:"
             if context:
                 user_message = f"Context: {context}\n\nPlease analyze this meeting transcript and create a summary based on the provided context:"
+            if target_language:
+                user_message += f"\n\nIMPORTANT: Please write the summary in {target_language}, regardless of the transcript language."
             user_message += f"\n\n{transcript}"
             
             response = self.client.chat.completions.create(
@@ -298,14 +310,18 @@ class AIProcessor:
             logging.error(f"Error generating summary: {e}")
             return f"Error generating summary: {e}"
             
-    def extract_action_items(self, transcript: str, prompt: str) -> str:
+    def extract_action_items(self, transcript: str, prompt: str, target_language: Optional[str] = None) -> str:
         """Extract and format action items using GPT-4o."""
         try:
+            user_message = f"Please extract action items from this meeting transcript:\n\n{transcript}"
+            if target_language:
+                user_message += f"\n\nIMPORTANT: Please write the action items in {target_language}, regardless of the transcript language."
+            
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": f"Please extract action items from this meeting transcript:\n\n{transcript}"}
+                    {"role": "user", "content": user_message}
                 ],
                 max_tokens=800,
                 temperature=0.2
@@ -354,6 +370,38 @@ class AIProcessor:
         except Exception as e:
             logging.error(f"Error detecting participants: {e}")
             return ["Unknown"]
+    
+    def translate_transcript(self, transcript: str, target_language: str = "Russian") -> str:
+        """Translate transcript to target language while preserving timestamps and names."""
+        try:
+            prompt = f"""Translate this meeting transcript to {target_language}. 
+            
+IMPORTANT RULES:
+1. Keep ALL timestamps exactly as they are: [MM:SS]
+2. Preserve proper names (like "Petia Bobov") exactly as written
+3. Translate only the spoken content, not the names or timestamps
+4. Maintain the same format and structure
+5. Ensure natural, fluent {target_language} translation
+
+Original transcript:"""
+
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a professional translator specializing in meeting transcripts. You preserve names and timestamps while providing accurate translations."},
+                    {"role": "user", "content": f"{prompt}\n\n{transcript}"}
+                ],
+                max_tokens=4000,
+                temperature=0.1
+            )
+            
+            translated_text = response.choices[0].message.content.strip()
+            logging.info(f"Successfully translated transcript to {target_language}")
+            return translated_text
+            
+        except Exception as e:
+            logging.error(f"Error translating transcript to {target_language}: {e}")
+            return transcript  # Return original if translation fails
 
 
 class ObsidianGenerator:
@@ -475,11 +523,16 @@ class PlaudProcessor:
     """Main processor pipeline for Plaud Pin recordings."""
     
     def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None, \
-                 context: Optional[str] = None, generate_action_items: bool = True):
+                 context: Optional[str] = None, generate_action_items: bool = True, \
+                 summary_language: Optional[str] = None, transcription_language: Optional[str] = None, \
+                 whisper_model: Optional[str] = None):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
         self.context = context
         self.generate_action_items = generate_action_items
+        self.summary_language = summary_language
+        self.transcription_language = transcription_language
+        self.whisper_model = whisper_model
         self.setup_logging()
         
         # Initialize components
@@ -491,7 +544,14 @@ class PlaudProcessor:
         
         # Use local transcription by default, with API fallback
         use_local = self.config.getboolean('SETTINGS', 'use_local_transcription', fallback=True)
-        local_model = self.config.get('SETTINGS', 'local_whisper_model', fallback='medium')
+        
+        # CLI model override takes precedence, then config
+        local_model = self.whisper_model
+        if not local_model:
+            local_model = self.config.get('SETTINGS', 'local_whisper_model', fallback='medium')
+        
+        if local_model:
+            logging.info(f"Using Whisper model: {local_model}")
         
         self.transcription_service = HybridTranscriptionService(
             api_key=api_key,
@@ -570,7 +630,20 @@ class PlaudProcessor:
             
             # Transcribe audio
             logging.info("Starting transcription...")
-            transcript_data = self.transcription_service.transcribe_audio(file_path)
+            
+            # Get language settings - CLI override takes precedence, then config
+            transcription_language = self.transcription_language
+            if not transcription_language:
+                transcription_language = self.config.get('SETTINGS', 'transcription_language', fallback=None)
+                if transcription_language and transcription_language.strip():
+                    transcription_language = transcription_language.strip()
+                else:
+                    transcription_language = None
+            
+            if transcription_language:
+                logging.info(f"Using transcription language: {transcription_language}")
+                
+            transcript_data = self.transcription_service.transcribe_audio(file_path, transcription_language)
             
             if 'error' in transcript_data:
                 logging.error(f"Transcription failed: {transcript_data['error']}")
@@ -587,17 +660,51 @@ class PlaudProcessor:
             
             # Use custom prompt if provided, otherwise use config prompt
             summary_prompt = self.custom_summary_prompt if self.custom_summary_prompt else prompts['summary_prompt']
+            
+            # Determine target language for summary
+            detected_language = transcript_data.get('language', 'unknown')
+            
+            # Check config for summary language setting
+            config_summary_language = self.config.get('SETTINGS', 'summary_language', fallback=None)
+            if config_summary_language and config_summary_language.strip():
+                config_summary_language = config_summary_language.strip()
+            else:
+                config_summary_language = None
+                
+            # Use priority: command-line > config > detected language
+            target_language = self.summary_language or config_summary_language or detected_language
+            
+            # Convert language codes to full names for clarity
+            language_map = {
+                'ru': 'Russian',
+                'en': 'English', 
+                'es': 'Spanish',
+                'fr': 'French',
+                'de': 'German',
+                'it': 'Italian',
+                'pt': 'Portuguese'
+            }
+            
+            if target_language in language_map:
+                target_language_name = language_map[target_language]
+            elif target_language != 'unknown':
+                target_language_name = target_language.title()
+            else:
+                target_language_name = 'the same language as the transcript'
+            
             summary = self.ai_processor.generate_summary(
                 transcript_data['text'], 
                 summary_prompt,
-                self.context
+                self.context,
+                target_language_name
             )
             
             # Only generate action items if requested
             if self.generate_action_items:
                 action_items = self.ai_processor.extract_action_items(
                     transcript_data['text'], 
-                    prompts['action_items_prompt']
+                    prompts['action_items_prompt'],
+                    target_language_name
                 )
             else:
                 action_items = "Action items generation disabled for this meeting."
@@ -709,6 +816,9 @@ if __name__ == "__main__":
     parser.add_argument('--custom-prompt', help='Custom prompt for meeting summarization')
     parser.add_argument('--context', help='Context about the meeting to guide summarization')
     parser.add_argument('--no-action-items', action='store_true', help='Disable action items generation')
+    parser.add_argument('--language', help='Override transcription language (e.g., en, ru, es). Defaults to config setting')
+    parser.add_argument('--model', help='Override Whisper model (tiny, base, small, medium, large, large-v2, large-v3). Defaults to config setting')
+    parser.add_argument('--summary-language', help='Language for summary and action items (e.g., en, ru, es). Defaults to transcript language')
     
     args = parser.parse_args()
     
@@ -720,7 +830,10 @@ if __name__ == "__main__":
             config_path=args.config,
             custom_summary_prompt=getattr(args, 'custom_prompt', None),
             context=getattr(args, 'context', None),
-            generate_action_items=not args.no_action_items
+            generate_action_items=not args.no_action_items,
+            summary_language=getattr(args, 'summary_language', None),
+            transcription_language=getattr(args, 'language', None),
+            whisper_model=getattr(args, 'model', None)
         )
         
         if args.file:

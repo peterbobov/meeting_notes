@@ -20,6 +20,10 @@ processed_audio/
 logs/
 *.log
 
+# Whisper model files (large binaries)
+whisper_models/
+*.bin
+
 # Python
 __pycache__/
 *.py[cod]

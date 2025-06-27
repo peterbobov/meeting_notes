@@ -443,6 +443,57 @@ meeting_data/2024-06-21_Project-Planning/
 
 ---
 
+## 🆕 LOCAL TRANSCRIPTION IMPLEMENTATION - June 2025
+
+### Local Whisper Support
+- **New Module**: `local_transcription.py` - Optimized local Whisper implementation
+- **M2 Mac Acceleration**: Metal Performance Shaders (MPS) support for superior performance
+- **Audio Optimizations**: Silence removal, normalization, and format conversion
+- **Memory Management**: Efficient processing with automatic cleanup
+- **Model Selection**: Support for all Whisper models (tiny to large-v3)
+
+### Whisper.cpp Backend
+- **New Module**: `whisper_cpp_backend.py` - Native whisper-cpp binary integration
+- **Apple Silicon Optimization**: Optimized for M2 Mac performance
+- **Model Management**: Automatic download and management of GGML models
+- **Audio Preprocessing**: 16kHz mono conversion for optimal performance
+- **Multi-threading**: 8-thread processing for speed
+
+### Hybrid Transcription Service
+- **Smart Fallback**: Local-first with API fallback
+- **Cost Optimization**: $0 transcription costs when using local models
+- **Configuration Options**: Choose between local and API transcription
+- **Processing Info**: Detailed metrics on transcription method and optimizations
+
+### Configuration Updates
+```ini
+[SETTINGS]
+# Enable local transcription (default: true)
+use_local_transcription = true
+
+# Choose Whisper model (default: medium)
+local_whisper_model = medium
+# Options: tiny, base, small, medium, large, large-v2, large-v3
+```
+
+### Performance Benefits
+- **Cost Savings**: $0.006/minute → $0 for transcription
+- **Privacy**: Audio never leaves your Mac during transcription
+- **Speed**: M2 acceleration + audio optimizations
+- **Offline Capability**: Works without internet for transcription
+
+### New Files Added
+```
+plaud_processor/
+├── local_transcription.py          # Local Whisper implementation
+├── whisper_cpp_backend.py          # whisper.cpp backend
+├── LOCAL_TRANSCRIPTION_GUIDE.md    # Detailed setup and usage guide
+└── whisper_models/                 # Directory for GGML models
+    └── ggml-medium.bin             # Downloaded model files
+```
+
+---
+
 ## 🆕 NEW FEATURES ADDED - June 2025
 
 ### Context Parameter for Custom Summarization
@@ -488,6 +539,36 @@ python main.py --monitor --context "Weekly team standup, highlight blockers and 
   - Navigation links in `1_meeting_meta.md` exclude action items reference
   - Processing is faster with fewer API calls
 - **Backward compatibility**: All existing functionality works unchanged
+
+---
+
+---
+
+## 🆕 TRANSCRIPTION QUALITY IMPROVEMENTS - June 2025
+
+### Russian Name Recognition Issue Solved
+**Problem Identified**: Russian transcription was incorrectly transcribing proper names
+- Russian models mapped unfamiliar names to common Russian alternatives
+- Large-v3 model showed same issue as medium model
+- English transcription preserved names more accurately
+
+**Solution Implemented**: 
+- **Medium + English model combination** provides best name accuracy for Russian speech
+- Added `--model` and `--language` CLI parameters for flexible transcription
+- Optimal workflow: `python main.py --file audio.mp3 --model medium --language en`
+
+### Model Selection Enhancement
+```bash
+# New CLI parameters available:
+python main.py --file audio.mp3 --model medium --language en
+python main.py --monitor --model large-v3 --language ru
+```
+
+
+### Recommended Workflow for Russian Content
+1. **For accuracy**: Use `--model medium --language en` 
+2. **Manual translation**: Create Russian version preserving correct names
+3. **Best of both**: Accurate English transcript + proper Russian translation
 
 ---
 

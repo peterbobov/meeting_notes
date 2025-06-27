@@ -24,10 +24,17 @@ local_whisper_model = medium
 # Recommended for M2 Mac 16GB: medium (best balance)
 # For highest accuracy: large-v3 (slower but better quality)
 
-[PROMPTS]
-summary_prompt = You are a meeting assistant. Analyze this transcript and create a concise summary focusing on key decisions, main topics discussed, and important insights. Format as markdown with clear sections for Key Points, Decisions Made, and Next Steps. IMPORTANT: Write your response in the same language as the transcript.
+# Language settings
+# Default language for transcription (ru for Russian, en for English, etc.)
+# Set to 'ru' for Russian as default, can be overridden with --language parameter
+transcription_language = ru 
+# summary_language: leave empty to use transcript language, or specify target language
+summary_language =
 
-action_items_prompt = Extract action items from this meeting transcript. For each action item, identify: 1) The specific task, 2) Who should do it (if mentioned), 3) Any deadlines or timeframes mentioned. Organize by priority (High, Medium, Low) and format as markdown with checkboxes. If no assignee is mentioned, use "Unassigned". Include context details when helpful. IMPORTANT: Write your response in the same language as the transcript.
+[PROMPTS]
+summary_prompt = You are a meeting assistant. Analyze this transcript and create a concise summary focusing on key decisions, main topics discussed, and important insights. Format as markdown with clear sections for Key Points, Decisions Made, and Next Steps. Always preserve the original language context of the meeting unless explicitly instructed otherwise.
+
+action_items_prompt = Extract action items from this meeting transcript. For each action item, identify: 1) The specific task, 2) Who should do it (if mentioned), 3) Any deadlines or timeframes mentioned. Organize by priority (High, Medium, Low) and format as markdown with checkboxes. If no assignee is mentioned, use "Unassigned". Include context details when helpful. Always preserve the original language context unless explicitly instructed otherwise.
 
 title_generation_prompt = Based on this meeting transcript, generate a concise, descriptive meeting title (max 6 words) that captures the main topic or purpose of the meeting.
 
