@@ -24,6 +24,9 @@ from pydub import AudioSegment
 # AI APIs
 from openai import OpenAI
 
+# Local transcription
+from local_transcription import LocalTranscriptionService, TranscriptionResult
+
 # Environment
 from dotenv import load_dotenv
 
@@ -116,23 +119,82 @@ class AudioProcessor:
             return file_path
 
 
-class TranscriptionService:
-    """Handles audio transcription using OpenAI Whisper API."""
+class HybridTranscriptionService:
+    """Hybrid transcription service that can use either local Whisper or OpenAI API."""
     
-    def __init__(self, api_key: str):
-        self.client = OpenAI(api_key=api_key)
+    def __init__(self, api_key: str, use_local: bool = True, local_model: str = "medium"):
+        self.api_key = api_key
+        self.use_local = use_local
+        self.local_model = local_model
+        
+        if use_local:
+            self.local_service = LocalTranscriptionService(
+                model_size=local_model,
+                enable_optimizations=True
+            )
+            logging.info(f"Initialized local transcription with model '{local_model}'")
+        else:
+            self.client = OpenAI(api_key=api_key)
+            logging.info("Initialized OpenAI API transcription service")
         
     def transcribe_audio(self, file_path: str) -> Dict:
         """
-        Transcribe audio using Whisper API.
+        Transcribe audio using either local Whisper or OpenAI API.
         Returns: {
             'text': full_transcript,
             'segments': timestamped_segments,
             'duration': duration_seconds,
-            'language': detected_language
+            'language': detected_language,
+            'processing_info': additional_processing_information
         }
         """
+        if self.use_local:
+            return self._transcribe_local(file_path)
+        else:
+            return self._transcribe_api(file_path)
+    
+    def _transcribe_local(self, file_path: str) -> Dict:
+        """Transcribe using local Whisper model."""
         try:
+            result = self.local_service.transcribe_audio(file_path)
+            
+            # Convert TranscriptionResult to expected format
+            return {
+                'text': result.text,
+                'segments': result.segments,
+                'duration': result.duration,
+                'language': result.language,
+                'processing_info': {
+                    'method': 'local_whisper',
+                    'model': result.model_used,
+                    'processing_time': result.processing_time,
+                    'optimizations': result.optimizations_applied,
+                    'confidence_scores': result.confidence_scores
+                }
+            }
+            
+        except Exception as e:
+            logging.error(f"Local transcription failed: {e}")
+            # Fallback to API if local fails
+            if hasattr(self, 'api_key'):
+                logging.info("Falling back to OpenAI API...")
+                return self._transcribe_api(file_path)
+            else:
+                return {
+                    'text': '',
+                    'segments': [],
+                    'duration': 0,
+                    'language': 'unknown',
+                    'error': str(e),
+                    'processing_info': {'method': 'local_whisper_failed'}
+                }
+    
+    def _transcribe_api(self, file_path: str) -> Dict:
+        """Transcribe using OpenAI Whisper API."""
+        try:
+            if not hasattr(self, 'client'):
+                self.client = OpenAI(api_key=self.api_key)
+                
             with open(file_path, "rb") as audio_file:
                 # Transcribe with timestamps
                 transcript = self.client.audio.transcriptions.create(
@@ -146,7 +208,11 @@ class TranscriptionService:
                 'text': transcript.text,
                 'segments': transcript.segments if hasattr(transcript, 'segments') else [],
                 'duration': transcript.duration if hasattr(transcript, 'duration') else 0,
-                'language': transcript.language if hasattr(transcript, 'language') else 'unknown'
+                'language': transcript.language if hasattr(transcript, 'language') else 'unknown',
+                'processing_info': {
+                    'method': 'openai_api',
+                    'model': 'whisper-1'
+                }
             }
             
         except Exception as e:
@@ -156,13 +222,18 @@ class TranscriptionService:
                 'segments': [],
                 'duration': 0,
                 'language': 'unknown',
-                'error': str(e)
+                'error': str(e),
+                'processing_info': {'method': 'api_failed'}
             }
             
-    def format_transcript_with_timestamps(self, segments: List) -> str:
+    def format_transcript_with_timestamps(self, segments: List, include_confidence: bool = False) -> str:
         """Format segments with timestamps for markdown."""
         if not segments:
             return "No timestamped segments available."
+            
+        # Use local service formatting if available and requested
+        if self.use_local and hasattr(self, 'local_service') and include_confidence:
+            return self.local_service.format_transcript_with_timestamps(segments, include_confidence)
             
         formatted_lines = []
         for segment in segments:
@@ -182,6 +253,19 @@ class TranscriptionService:
         minutes = int(seconds // 60)
         seconds = int(seconds % 60)
         return f"{minutes:02d}:{seconds:02d}"
+        
+    def get_transcription_info(self) -> Dict:
+        """Get information about the transcription service configuration."""
+        if self.use_local and hasattr(self, 'local_service'):
+            return {
+                'mode': 'local',
+                'model_info': self.local_service.get_model_info()
+            }
+        else:
+            return {
+                'mode': 'api',
+                'model': 'whisper-1'
+            }
 
 
 class AIProcessor:
@@ -374,8 +458,9 @@ class ObsidianGenerator:
 class PlaudProcessor:
     """Main processor pipeline for Plaud Pin recordings."""
     
-    def __init__(self, config_path: str = "config.ini"):
+    def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None):
         self.config = self.load_config(config_path)
+        self.custom_summary_prompt = custom_summary_prompt
         self.setup_logging()
         
         # Initialize components
@@ -384,7 +469,16 @@ class PlaudProcessor:
             raise ValueError("OpenAI API key not found. Please set OPENAI_API_KEY in your .env file")
             
         self.audio_processor = AudioProcessor(self.config)
-        self.transcription_service = TranscriptionService(api_key)
+        
+        # Use local transcription by default, with API fallback
+        use_local = self.config.getboolean('SETTINGS', 'use_local_transcription', fallback=True)
+        local_model = self.config.get('SETTINGS', 'local_whisper_model', fallback='medium')
+        
+        self.transcription_service = HybridTranscriptionService(
+            api_key=api_key,
+            use_local=use_local,
+            local_model=local_model
+        )
         self.ai_processor = AIProcessor(api_key)
         
         # Handle environment variable substitution for output folder
@@ -472,9 +566,11 @@ class PlaudProcessor:
                 prompts['title_generation_prompt']
             )
             
+            # Use custom prompt if provided, otherwise use config prompt
+            summary_prompt = self.custom_summary_prompt if self.custom_summary_prompt else prompts['summary_prompt']
             summary = self.ai_processor.generate_summary(
                 transcript_data['text'], 
-                prompts['summary_prompt']
+                summary_prompt
             )
             
             action_items = self.ai_processor.extract_action_items(
@@ -583,6 +679,7 @@ if __name__ == "__main__":
     parser.add_argument('--file', help='Process single audio file')
     parser.add_argument('--monitor', action='store_true', help='Monitor folder for new files')
     parser.add_argument('--config', default='config.ini', help='Config file path')
+    parser.add_argument('--custom-prompt', help='Custom prompt for meeting summarization')
     
     args = parser.parse_args()
     
@@ -590,7 +687,7 @@ if __name__ == "__main__":
     print("=" * 40)
     
     try:
-        processor = PlaudProcessor(args.config)
+        processor = PlaudProcessor(args.config, getattr(args, 'custom_prompt', None))
         
         if args.file:
             if Path(args.file).exists():
@@ -614,6 +711,7 @@ if __name__ == "__main__":
             print("  python main.py --file path/to/audio.mp3")
             print("  python main.py --monitor")
             print("  python main.py --monitor --config custom_config.ini")
+            print("  python main.py --file audio.mp3 --custom-prompt 'Create a technical summary focusing on decisions and blockers'")
             
     except Exception as e:
         print(f"❌ Error: {e}")

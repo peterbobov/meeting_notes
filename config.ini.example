@@ -17,6 +17,13 @@ max_file_size_mb = 500
 supported_formats = mp3,wav,m4a,aac
 processing_timeout_minutes = 30
 
+# Local Transcription Settings
+use_local_transcription = true
+local_whisper_model = medium
+# Options: tiny, base, small, medium, large, large-v2, large-v3
+# Recommended for M2 Mac 16GB: medium (best balance)
+# For highest accuracy: large-v3 (slower but better quality)
+
 [PROMPTS]
 summary_prompt = You are a meeting assistant. Analyze this transcript and create a concise summary focusing on key decisions, main topics discussed, and important insights. Format as markdown with clear sections for Key Points, Decisions Made, and Next Steps. IMPORTANT: Write your response in the same language as the transcript.
 
