@@ -16,6 +16,8 @@ import time
 import hashlib
 import shutil
 import re
+import sys
+import threading
 
 # Audio processing
 import librosa
@@ -35,6 +37,100 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+
+class TranscriptionProgressBar:
+    """
+    Progress bar for transcription tasks with time estimation
+    """
+    
+    def __init__(self, total_duration_seconds: float, description: str = "Transcribing"):
+        self.total_duration = total_duration_seconds
+        self.description = description
+        self.start_time = time.time()
+        self.current_progress = 0.0
+        self.is_running = False
+        self.last_update = 0
+        self.bar_width = 40
+        
+    def start(self):
+        """Start the progress bar"""
+        self.start_time = time.time()
+        self.is_running = True
+        self.current_progress = 0.0
+        
+    def update(self, current_seconds: float):
+        """
+        Update progress based on current timestamp in the audio
+        
+        Args:
+            current_seconds: Current position in the audio file (in seconds)
+        """
+        if not self.is_running:
+            return
+            
+        self.current_progress = min(current_seconds / self.total_duration, 1.0) if self.total_duration > 0 else 0.0
+        
+        # Only update display every 2 seconds to avoid spam
+        current_time = time.time()
+        if current_time - self.last_update >= 2.0 or self.current_progress >= 1.0:
+            self._display_progress()
+            self.last_update = current_time
+    
+    def _display_progress(self):
+        """Display the current progress bar"""
+        if not self.is_running:
+            return
+            
+        # Calculate time estimates
+        elapsed_time = time.time() - self.start_time
+        if self.current_progress > 0:
+            estimated_total = elapsed_time / self.current_progress
+            remaining_time = max(0, estimated_total - elapsed_time)
+        else:
+            remaining_time = 0
+        
+        # Create progress bar
+        filled_width = int(self.bar_width * self.current_progress)
+        bar = '█' * filled_width + '░' * (self.bar_width - filled_width)
+        
+        # Format time
+        remaining_str = self._format_time(remaining_time)
+        
+        # Create progress line
+        percentage = self.current_progress * 100
+        progress_line = f"\r{self.description}: {bar} {percentage:.0f}% ({remaining_str} remaining)"
+        
+        # Print without newline, flush immediately
+        print(progress_line, end='', file=sys.stderr, flush=True)
+    
+    def finish(self, success: bool = True):
+        """Complete the progress bar"""
+        if not self.is_running:
+            return
+            
+        self.is_running = False
+        self.current_progress = 1.0
+        
+        if success:
+            # Show completed bar
+            bar = '█' * self.bar_width
+            elapsed = time.time() - self.start_time
+            elapsed_str = self._format_time(elapsed)
+            final_line = f"\r{self.description}: {bar} 100% (completed in {elapsed_str})"
+            print(final_line, file=sys.stderr)
+        else:
+            # Show failed bar
+            print(f"\r{self.description}: Failed after {self._format_time(time.time() - self.start_time)}", file=sys.stderr)
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format time in MM:SS format"""
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        else:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}:{secs:02d}"
 
 
 class AudioProcessor:
@@ -525,7 +621,7 @@ class PlaudProcessor:
     def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None, \
                  context: Optional[str] = None, generate_action_items: bool = True, \
                  summary_language: Optional[str] = None, transcription_language: Optional[str] = None, \
-                 whisper_model: Optional[str] = None):
+                 whisper_model: Optional[str] = None, verbose: bool = False):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
         self.context = context
@@ -533,6 +629,7 @@ class PlaudProcessor:
         self.summary_language = summary_language
         self.transcription_language = transcription_language
         self.whisper_model = whisper_model
+        self.verbose = verbose
         self.setup_logging()
         
         # Initialize components
@@ -599,14 +696,22 @@ class PlaudProcessor:
         return config
         
     def setup_logging(self):
-        """Setup logging configuration."""
+        """Setup logging configuration based on verbose mode."""
         logs_folder = Path(self.config['PATHS']['logs_folder'])
         logs_folder.mkdir(parents=True, exist_ok=True)
         
         log_file = logs_folder / f"plaud_processor_{datetime.date.today().strftime('%Y%m%d')}.log"
         
+        # Determine log level based on verbose flag
+        console_level = logging.DEBUG if self.verbose else logging.INFO
+        
+        # Clear any existing handlers to avoid duplicates
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+        
+        # Setup logging with appropriate level
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,  # Always log everything to file
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(log_file),
@@ -614,22 +719,151 @@ class PlaudProcessor:
             ]
         )
         
+        # Set console handler to appropriate level
+        console_handler = logging.getLogger().handlers[-1]  # StreamHandler is last
+        console_handler.setLevel(console_level)
+        
+        if not self.verbose:
+            # In non-verbose mode, create a custom filter for cleaner output
+            console_handler.addFilter(self._clean_output_filter)
+    
+    def _clean_output_filter(self, record):
+        """
+        Filter log records for clean, non-verbose output.
+        Only shows important progress messages, hides detailed technical logs.
+        """
+        message = record.getMessage()
+        
+        # Always show error and warning messages
+        if record.levelno >= logging.WARNING:
+            return True
+        
+        # Progress bars are now handled directly via stdout, not logging
+        # So we don't need to filter them here anymore
+        
+        # Show main pipeline progress
+        if any(phase in message for phase in ['[PIPELINE]', '[VALIDATION]', '[TRANSCRIPTION]', '[AI_PROCESSING]', '[FILE_GENERATION]', '[CLEANUP]']):
+            # But hide the detailed sub-phases in non-verbose mode
+            if any(detail in message.lower() for detail in [
+                'model loaded', 'audio loaded', 'optimization', 'generating meeting title',
+                'generating summary', 'extracting action items', 'detecting participants',
+                'generating markdown', 'writing files', 'archiving', 'cleaning up'
+            ]):
+                return False
+            return True
+        
+        # Hide all detailed technical logs from LOCAL_TRANSCRIPTION and WHISPER_CPP in non-verbose mode
+        if any(prefix in message for prefix in ['[LOCAL_TRANSCRIPTION]', '[WHISPER_CPP]']):
+            return False
+        
+        # Show important general messages
+        if any(keyword in message.lower() for keyword in [
+            'processing complete', 'successfully processed', 'created meeting files',
+            'failed', 'error', 'starting', 'completed'
+        ]):
+            return True
+        
+        # Hide HTTP requests and other detailed logs
+        if any(detail in message for detail in ['HTTP Request:', 'OpenAI', 'api.openai.com']):
+            return False
+        
+        # Default: show other INFO messages
+        return True
+        
+    def log_progress(self, phase: str, message: str, progress: int = None):
+        """
+        Centralized progress logging with consistent formatting.
+        
+        Args:
+            phase: Processing phase (VALIDATION, TRANSCRIPTION, AI_PROCESSING, etc.)
+            message: Progress message
+            progress: Optional progress percentage (0-100)
+        """
+        if progress is not None:
+            logging.info(f"[{phase}] {message} ({progress}%)")
+        else:
+            logging.info(f"[{phase}] {message}")
+    
+    def _validate_transcript(self, transcript_data: Dict) -> bool:
+        """
+        Validate transcript content to ensure it's not empty or corrupted
+        
+        Args:
+            transcript_data: Dictionary containing transcript text and metadata
+            
+        Returns:
+            bool: True if transcript is valid, False otherwise
+        """
+        try:
+            # Check if transcript_data has required structure
+            if not isinstance(transcript_data, dict):
+                logging.error("Transcript data is not a dictionary")
+                return False
+            
+            # Check for text content
+            text = transcript_data.get('text', '')
+            if not text or not isinstance(text, str):
+                logging.error("Transcript contains no text content")
+                return False
+            
+            # Check minimum length (at least 10 characters of actual content)
+            cleaned_text = text.strip()
+            if len(cleaned_text) < 10:
+                logging.error(f"Transcript too short: {len(cleaned_text)} characters")
+                return False
+            
+            # Check for segments if available
+            segments = transcript_data.get('segments', [])
+            if segments and len(segments) == 0:
+                logging.warning("No segments found in transcript")
+            
+            # Check for obvious error indicators
+            error_phrases = [
+                "failed to transcribe",
+                "no audio detected",
+                "transcription error",
+                "unable to process",
+                "im sorry but i cant generate",
+                "i need more information"
+            ]
+            
+            text_lower = cleaned_text.lower()
+            for error_phrase in error_phrases:
+                if error_phrase in text_lower:
+                    logging.error(f"Transcript contains error indicator: '{error_phrase}'")
+                    return False
+            
+            # Additional validation for recovered transcripts
+            optimizations = transcript_data.get('optimizations_applied', [])
+            if 'emergency_recovery' in optimizations:
+                logging.warning("Transcript was recovered using emergency methods - quality may be reduced")
+                # Still allow it through but warn user
+            
+            logging.info(f"Transcript validation passed: {len(cleaned_text)} characters, {len(segments)} segments")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Transcript validation failed with error: {e}")
+            return False
+        
     def process_audio_file(self, file_path: str):
         """Main processing pipeline for a single audio file."""
         try:
-            logging.info(f"Processing audio file: {file_path}")
+            self.log_progress("PIPELINE", f"Starting processing of {Path(file_path).name}")
             
-            # Validate audio file
+            # Phase 1: Validation
+            self.log_progress("VALIDATION", "Validating audio file...")
             if not self.audio_processor.validate_audio_file(file_path):
                 logging.error(f"Invalid audio file: {file_path}")
                 return False
+            self.log_progress("VALIDATION", "Audio file validation complete")
                 
             # Get duration for cost estimation
             duration = self.audio_processor.get_audio_duration(file_path)
-            logging.info(f"Audio duration: {duration:.1f} minutes")
+            self.log_progress("VALIDATION", f"Audio duration: {duration:.1f} minutes")
             
-            # Transcribe audio
-            logging.info("Starting transcription...")
+            # Phase 2: Transcription Setup
+            self.log_progress("TRANSCRIPTION", "Preparing transcription...")
             
             # Get language settings - CLI override takes precedence, then config
             transcription_language = self.transcription_language
@@ -641,18 +875,28 @@ class PlaudProcessor:
                     transcription_language = None
             
             if transcription_language:
-                logging.info(f"Using transcription language: {transcription_language}")
-                
+                self.log_progress("TRANSCRIPTION", f"Using transcription language: {transcription_language}")
+            
+            # Phase 3: Transcription Processing
+            self.log_progress("TRANSCRIPTION", "Starting audio transcription...")
             transcript_data = self.transcription_service.transcribe_audio(file_path, transcription_language)
             
             if 'error' in transcript_data:
                 logging.error(f"Transcription failed: {transcript_data['error']}")
                 return False
+            
+            # Validate transcript content before proceeding
+            if not self._validate_transcript(transcript_data):
+                logging.error("Transcript validation failed - content is empty or invalid")
+                return False
+            
+            self.log_progress("TRANSCRIPTION", "Transcription completed successfully")
                 
-            # Generate AI content
-            logging.info("Generating AI content...")
+            # Phase 4: AI Processing
+            self.log_progress("AI_PROCESSING", "Generating AI content...")
             prompts = self.config['PROMPTS']
             
+            self.log_progress("AI_PROCESSING", "Generating meeting title...")
             title = self.ai_processor.generate_meeting_title(
                 transcript_data['text'], 
                 prompts['title_generation_prompt']
@@ -692,6 +936,7 @@ class PlaudProcessor:
             else:
                 target_language_name = 'the same language as the transcript'
             
+            self.log_progress("AI_PROCESSING", f"Generating summary in {target_language_name}...")
             summary = self.ai_processor.generate_summary(
                 transcript_data['text'], 
                 summary_prompt,
@@ -701,6 +946,7 @@ class PlaudProcessor:
             
             # Only generate action items if requested
             if self.generate_action_items:
+                self.log_progress("AI_PROCESSING", "Extracting action items...")
                 action_items = self.ai_processor.extract_action_items(
                     transcript_data['text'], 
                     prompts['action_items_prompt'],
@@ -709,12 +955,14 @@ class PlaudProcessor:
             else:
                 action_items = "Action items generation disabled for this meeting."
             
+            self.log_progress("AI_PROCESSING", "Detecting participants...")
             participants = self.ai_processor.detect_participants(
                 transcript_data['text'], 
                 prompts['participant_detection_prompt']
             )
             
-            # Create output folder and files
+            # Phase 5: File Generation
+            self.log_progress("FILE_GENERATION", "Creating output structure...")
             date_str = datetime.date.today().strftime('%Y-%m-%d')
             meeting_folder = self.obsidian_generator.create_meeting_folder(title, date_str)
             
@@ -754,6 +1002,7 @@ class PlaudProcessor:
             }
             
             # Generate file contents
+            self.log_progress("FILE_GENERATION", "Generating markdown files...")
             files_content = {
                 'meta': self.obsidian_generator.generate_meta_file(meeting_data, self.generate_action_items),
                 'transcript': self.obsidian_generator.generate_transcript_file(transcript_file_data),
@@ -765,14 +1014,14 @@ class PlaudProcessor:
                 files_content['action_items'] = self.obsidian_generator.generate_action_items_file(action_items_file_data)
             
             # Write files
+            self.log_progress("FILE_GENERATION", "Writing files to disk...")
             self.obsidian_generator.write_files(meeting_folder, files_content, self.generate_action_items)
             
-            # Move processed file
+            # Phase 6: Cleanup
+            self.log_progress("CLEANUP", "Archiving processed file...")
             processed_path = self.audio_processor.move_to_processed(file_path)
-            logging.info(f"Moved processed file to: {processed_path}")
             
-            logging.info(f"Successfully processed: {file_path}")
-            logging.info(f"Output folder: {meeting_folder}")
+            self.log_progress("PIPELINE", f"Processing complete! Output: {meeting_folder}")
             
             return True
             
@@ -819,6 +1068,7 @@ if __name__ == "__main__":
     parser.add_argument('--language', help='Override transcription language (e.g., en, ru, es). Defaults to config setting')
     parser.add_argument('--model', help='Override Whisper model (tiny, base, small, medium, large, large-v2, large-v3). Defaults to config setting')
     parser.add_argument('--summary-language', help='Language for summary and action items (e.g., en, ru, es). Defaults to transcript language')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging for debugging (default: clean progress display)')
     
     args = parser.parse_args()
     
@@ -833,7 +1083,8 @@ if __name__ == "__main__":
             generate_action_items=not args.no_action_items,
             summary_language=getattr(args, 'summary_language', None),
             transcription_language=getattr(args, 'language', None),
-            whisper_model=getattr(args, 'model', None)
+            whisper_model=getattr(args, 'model', None),
+            verbose=args.verbose
         )
         
         if args.file:

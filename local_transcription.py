@@ -98,22 +98,30 @@ class LocalTranscriptionService:
     def load_model(self) -> bool:
         """Load Whisper model with error handling"""
         try:
-            logging.info(f"Loading Whisper model '{self.model_size}'...")
+            logging.info(f"[LOCAL_TRANSCRIPTION] Loading Whisper model '{self.model_size}'...")
             model_info = self.model_specs.get(self.model_size, {})
-            logging.info(f"Model specs: {model_info}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] Model specs: {model_info}")
+            
+            # Check if model needs to be downloaded
+            logging.info(f"[LOCAL_TRANSCRIPTION] Checking model availability...")
             
             start_time = time.time()
             self.model = whisper.load_model(self.model_size, device=self.device)
             load_time = time.time() - start_time
             
-            logging.info(f"Model loaded successfully in {load_time:.2f} seconds")
+            # Get model information
+            model_params = sum(p.numel() for p in self.model.parameters())
+            logging.info(f"[LOCAL_TRANSCRIPTION] Model loaded successfully:")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Load time: {load_time:.2f} seconds")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Parameters: {model_params:,}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Device: {self.device}")
             return True
             
         except Exception as e:
-            logging.error(f"Failed to load Whisper model '{self.model_size}': {e}")
+            logging.error(f"[LOCAL_TRANSCRIPTION] Failed to load Whisper model '{self.model_size}': {e}")
             # Try fallback to smaller model
             if self.model_size != "base":
-                logging.info("Attempting fallback to 'base' model...")
+                logging.info("[LOCAL_TRANSCRIPTION] Attempting fallback to 'base' model...")
                 self.model_size = "base"
                 return self.load_model()
             return False
@@ -126,28 +134,46 @@ class LocalTranscriptionService:
             Tuple of (optimized_file_path, list_of_optimizations_applied)
         """
         optimizations = []
+        optimization_start = time.time()
         
         try:
+            logging.info(f"[LOCAL_TRANSCRIPTION] Starting audio optimization for {Path(audio_path).name}")
+            
             # Load audio file
+            load_start = time.time()
             audio = AudioSegment.from_file(audio_path)
             original_duration = len(audio)
+            original_size = len(audio.raw_data)
+            load_time = time.time() - load_start
+            
+            logging.info(f"[LOCAL_TRANSCRIPTION] Audio loaded in {load_time:.2f}s:")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Duration: {original_duration/1000:.1f}s")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Channels: {audio.channels}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Sample rate: {audio.frame_rate}Hz")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Size: {original_size/1024/1024:.1f}MB")
             
             # Convert to mono if stereo
             if audio.channels > 1:
+                logging.info("[LOCAL_TRANSCRIPTION] Converting stereo to mono...")
                 audio = audio.set_channels(1)
                 optimizations.append("converted_to_mono")
                 
             # Normalize sample rate to 16kHz (Whisper's preferred rate)
             if audio.frame_rate != self.audio_settings["target_sample_rate"]:
+                logging.info(f"[LOCAL_TRANSCRIPTION] Resampling to {self.audio_settings['target_sample_rate']}Hz...")
                 audio = audio.set_frame_rate(self.audio_settings["target_sample_rate"])
                 optimizations.append(f"resampled_to_{self.audio_settings['target_sample_rate']}hz")
             
             # Normalize audio levels
+            logging.info("[LOCAL_TRANSCRIPTION] Normalizing audio levels...")
             audio = audio.normalize()
             optimizations.append("normalized_levels")
             
             # Remove silence (if enabled and beneficial)
             if self.enable_optimizations:
+                logging.info("[LOCAL_TRANSCRIPTION] Analyzing silence removal...")
+                silence_start = time.time()
+                
                 # Split on silence and rejoin with minimal silence
                 chunks = split_on_silence(
                     audio,
@@ -157,32 +183,49 @@ class LocalTranscriptionService:
                 )
                 
                 if len(chunks) > 1:  # Only if silence was actually found
+                    logging.info(f"[LOCAL_TRANSCRIPTION] Found {len(chunks)} audio chunks, removing silence...")
                     audio = AudioSegment.empty()
                     for chunk in chunks:
                         audio += chunk + AudioSegment.silent(duration=self.audio_settings["keep_silence"])
                     
                     new_duration = len(audio)
                     reduction_percent = ((original_duration - new_duration) / original_duration) * 100
+                    silence_time = time.time() - silence_start
                     
                     if reduction_percent > 5:  # Only if significant reduction
+                        logging.info(f"[LOCAL_TRANSCRIPTION] Silence removed: {reduction_percent:.1f}% reduction in {silence_time:.2f}s")
                         optimizations.append(f"removed_silence_{reduction_percent:.1f}%_reduction")
                     else:
                         # Reload original if minimal benefit
+                        logging.info(f"[LOCAL_TRANSCRIPTION] Silence removal not beneficial ({reduction_percent:.1f}%), keeping original")
                         audio = AudioSegment.from_file(audio_path)
                         optimizations = [opt for opt in optimizations if "removed_silence" not in opt]
+                else:
+                    logging.info("[LOCAL_TRANSCRIPTION] No significant silence found")
             
             # Export optimized audio to temporary file
+            export_start = time.time()
             temp_dir = Path(tempfile.gettempdir()) / "plaud_processor"
             temp_dir.mkdir(exist_ok=True)
             
             optimized_path = temp_dir / f"optimized_{Path(audio_path).stem}.wav"
             audio.export(str(optimized_path), format="wav")
+            export_time = time.time() - export_start
             
-            logging.info(f"Audio optimized: {len(optimizations)} optimizations applied")
+            optimization_time = time.time() - optimization_start
+            final_size = len(audio.raw_data)
+            size_reduction = ((original_size - final_size) / original_size) * 100
+            
+            logging.info(f"[LOCAL_TRANSCRIPTION] Audio optimization complete:")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Total time: {optimization_time:.2f}s")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Export time: {export_time:.2f}s")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Size reduction: {size_reduction:.1f}%")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Applied optimizations: {', '.join(optimizations)}")
+            
             return str(optimized_path), optimizations
             
         except Exception as e:
-            logging.warning(f"Audio optimization failed: {e}. Using original file.")
+            logging.warning(f"[LOCAL_TRANSCRIPTION] Audio optimization failed: {e}. Using original file.")
             return audio_path, ["optimization_failed_using_original"]
     
     def transcribe_audio(self, file_path: str, language: Optional[str] = None) -> TranscriptionResult:
@@ -199,8 +242,11 @@ class LocalTranscriptionService:
         start_time = time.time()
         
         try:
+            logging.info(f"[LOCAL_TRANSCRIPTION] Starting transcription process for {Path(file_path).name}")
+            
             # Ensure model is loaded
             if self.model is None:
+                logging.info("[LOCAL_TRANSCRIPTION] Model not loaded, loading now...")
                 if not self.load_model():
                     raise Exception("Failed to load Whisper model")
             
@@ -209,6 +255,8 @@ class LocalTranscriptionService:
                 raise FileNotFoundError(f"Audio file not found: {file_path}")
                 
             file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+            logging.info(f"[LOCAL_TRANSCRIPTION] File size: {file_size_mb:.1f}MB")
+            
             if file_size_mb > self.audio_settings["max_file_size_mb"]:
                 raise ValueError(f"File too large: {file_size_mb:.1f}MB > {self.audio_settings['max_file_size_mb']}MB")
             
@@ -217,11 +265,17 @@ class LocalTranscriptionService:
             optimizations = []
             
             if self.enable_optimizations:
+                logging.info("[LOCAL_TRANSCRIPTION] Audio optimization enabled, starting optimization...")
                 audio_path, optimizations = self.optimize_audio(file_path)
                 self.optimizations_applied = optimizations
+            else:
+                logging.info("[LOCAL_TRANSCRIPTION] Audio optimization disabled, using original file")
             
             # Transcribe with Whisper
-            logging.info(f"Starting transcription with model '{self.model_size}'...")
+            logging.info(f"[LOCAL_TRANSCRIPTION] Starting Whisper transcription:")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Model: {self.model_size}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Device: {self.device}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Language: {language if language else 'auto-detect'}")
             
             # Configure transcription options
             transcribe_options = {
@@ -234,8 +288,14 @@ class LocalTranscriptionService:
                 "beam_size": 1,  # Greedy decoding for speed
             }
             
-            # Perform transcription
+            # Perform transcription with progress indication
+            transcribe_start = time.time()
+            
+            # Show simple progress indication for local transcription
+            logging.info("[LOCAL_TRANSCRIPTION] Processing audio with Whisper model...")
+            
             result = self.model.transcribe(audio_path, **transcribe_options)
+            transcribe_time = time.time() - transcribe_start
             
             # Calculate confidence scores (approximation based on segment probabilities)
             confidence_scores = []
@@ -248,12 +308,23 @@ class LocalTranscriptionService:
                 confidence_scores.append(confidence)
             
             processing_time = time.time() - start_time
+            avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+            
+            logging.info(f"[LOCAL_TRANSCRIPTION] Transcription completed:")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Transcribe time: {transcribe_time:.2f}s")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Total processing time: {processing_time:.2f}s")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Detected language: {result.get('language', 'unknown')}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Average confidence: {avg_confidence:.2f}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Segments: {len(result.get('segments', []))}")
+            logging.info(f"[LOCAL_TRANSCRIPTION] - Text length: {len(result['text'])} characters")
             
             # Clean up temporary files
             if audio_path != file_path and Path(audio_path).exists():
+                logging.info("[LOCAL_TRANSCRIPTION] Cleaning up temporary files...")
                 Path(audio_path).unlink()
             
             # Force garbage collection to free memory
+            logging.info("[LOCAL_TRANSCRIPTION] Freeing memory...")
             gc.collect()
             if self.device == "mps":
                 torch.mps.empty_cache()

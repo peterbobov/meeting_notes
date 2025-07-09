@@ -564,11 +564,59 @@ python main.py --file audio.mp3 --model medium --language en
 python main.py --monitor --model large-v3 --language ru
 ```
 
-
 ### Recommended Workflow for Russian Content
 1. **For accuracy**: Use `--model medium --language en` 
 2. **Manual translation**: Create Russian version preserving correct names
 3. **Best of both**: Accurate English transcript + proper Russian translation
+
+---
+
+## 🆕 MAJOR STABILITY & UX IMPROVEMENTS - July 2025
+
+### Critical Bug Fixes - Data Loss Prevention 🚨
+**Problem Solved**: UTF-8 encoding errors causing complete loss of transcription after 18+ minutes of work
+
+**Solutions Implemented**:
+- **Robust Encoding Handling**: Multi-encoding fallback (utf-8 → cp1251 → latin-1 → utf-16)
+- **Partial Transcription Recovery**: Real-time capture of transcript lines with automatic fallback
+- **Transcript Validation**: Comprehensive content validation before AI processing
+- **Graceful Degradation**: Recovery methods that parse timestamps and text from stdout
+
+### Enhanced User Experience - Verbose Logging & Progress Bars
+**New `--verbose` / `-v` Flag**:
+```bash
+# Clean, minimal output with progress bars (default)
+python main.py --file audio.mp3
+
+# Detailed debugging output
+python main.py --file audio.mp3 --verbose
+python main.py --file audio.mp3 -v
+```
+
+**Smart Progress Bars** (like tqdm):
+- **In-place updating progress bar** for whisper.cpp transcription
+- **Real-time time estimation** based on audio duration
+- **Clean integration** with logging system
+- **Automatic verbose mode detection** (progress bars in clean mode, detailed logs in verbose mode)
+
+### Progress Bar Features
+```
+Default Mode:
+[TRANSCRIPTION] Starting audio transcription...
+Transcribing audio: ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 30% (15:20/53:17, 12:45 remaining)
+[TRANSCRIPTION] Transcription completed successfully
+
+Verbose Mode:
+[WHISPER_CPP] [00:12:34.100 --> 00:12:34.100] Alright.
+[WHISPER_CPP] [00:12:35.200 --> 00:12:35.200] Got you.
+[WHISPER_CPP] Model loaded successfully in 2.34 seconds
+```
+
+### Advanced Recovery System
+- **Never lose transcription work** due to encoding issues
+- **Automatic partial result recovery** from stdout parsing
+- **Multi-level fallback system** for maximum reliability
+- **Comprehensive error handling** with graceful degradation
 
 ---
 
