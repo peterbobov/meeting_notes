@@ -908,6 +908,19 @@ class PlaudProcessor:
             # Determine target language for summary
             detected_language = transcript_data.get('language', 'unknown')
             
+            # If detected language is unknown, use the transcription language that was actually used
+            if detected_language == 'unknown':
+                # First check if language was specified via command line
+                if hasattr(self, 'transcription_language') and self.transcription_language:
+                    detected_language = self.transcription_language
+                    logging.info(f"Using command-line transcription language '{detected_language}' since detection failed")
+                else:
+                    # Fallback to configured transcription language
+                    config_transcription_language = self.config.get('SETTINGS', 'transcription_language', fallback='unknown')
+                    if config_transcription_language and config_transcription_language.strip():
+                        detected_language = config_transcription_language.strip()
+                        logging.info(f"Using configured transcription language '{detected_language}' since detection failed")
+            
             # Check config for summary language setting
             config_summary_language = self.config.get('SETTINGS', 'summary_language', fallback=None)
             if config_summary_language and config_summary_language.strip():
@@ -921,20 +934,35 @@ class PlaudProcessor:
             # Convert language codes to full names for clarity
             language_map = {
                 'ru': 'Russian',
-                'en': 'English', 
+                'russian': 'Russian',
+                'rus': 'Russian',
+                'en': 'English',
+                'english': 'English', 
+                'eng': 'English',
                 'es': 'Spanish',
+                'spanish': 'Spanish',
                 'fr': 'French',
+                'french': 'French',
                 'de': 'German',
+                'german': 'German',
                 'it': 'Italian',
-                'pt': 'Portuguese'
+                'italian': 'Italian',
+                'pt': 'Portuguese',
+                'portuguese': 'Portuguese'
             }
             
-            if target_language in language_map:
-                target_language_name = language_map[target_language]
+            # Normalize language code for mapping
+            target_language_lower = target_language.lower() if target_language else 'unknown'
+            
+            if target_language_lower in language_map:
+                target_language_name = language_map[target_language_lower]
             elif target_language != 'unknown':
                 target_language_name = target_language.title()
             else:
                 target_language_name = 'the same language as the transcript'
+            
+            # Add debug logging to see what language is being detected
+            logging.info(f"Language detection: detected='{detected_language}', target='{target_language}', mapped='{target_language_name}'")
             
             self.log_progress("AI_PROCESSING", f"Generating summary in {target_language_name}...")
             summary = self.ai_processor.generate_summary(
