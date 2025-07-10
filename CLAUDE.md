@@ -620,6 +620,83 @@ Verbose Mode:
 
 ---
 
+## 🆕 SPEAKER DIARIZATION IMPLEMENTATION - July 2025
+
+### Advanced Speaker Identification System
+**New Feature**: Complete speaker diarization with interactive naming workflow
+
+**Implementation Details**:
+- **New Module**: `speaker_diarization.py` - Full speaker identification pipeline
+- **Interactive Workflow**: `InteractiveSpeakerNaming` class for user-friendly speaker labeling
+- **M2 Mac Optimization**: Metal Performance Shaders (MPS) acceleration for pyannote-audio
+- **Local Processing**: 100% on-device processing for privacy and security
+- **Parallel Processing**: Runs alongside transcription for efficient workflow
+
+### Key Features
+- **Voice Activity Detection**: Identifies speech vs silence segments
+- **Speaker Clustering**: Groups audio segments by speaker identity
+- **Interactive Naming**: Sample quotes with timestamps for easy speaker identification
+- **Speaker Statistics**: Speaking time, participation metrics, turn-taking analysis
+- **Enhanced Transcripts**: Speaker-labeled transcripts with accurate attribution
+- **AI Integration**: Speaker-aware summaries and action items generation
+
+### CLI Parameters
+```bash
+# Enable speaker identification with interactive naming
+python main.py --file meeting.mp3 --speakers
+
+# Skip interactive naming (keep default Speaker A, B, C names)
+python main.py --file meeting.mp3 --speakers --no-interactive
+
+# Combined with other features
+python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
+```
+
+### Interactive Naming Workflow
+```
+Found 3 speakers in this meeting.
+Please provide names for each speaker (press Enter to keep default name):
+
+Speaker A said at [02:15]: "I think we should focus on the quarterly targets..."
+Please enter name for Speaker A: John Smith
+
+Speaker B said at [03:42]: "That's a good point, but we also need to consider..."
+Please enter name for Speaker B: Sarah Johnson
+
+Speaker C said at [05:18]: "I agree with both perspectives..."
+Please enter name for Speaker C: Mike Chen
+```
+
+### Requirements & Setup
+- **Dependencies**: `pyannote-audio>=3.1.0` (installed via requirements.txt)
+- **HuggingFace Token**: Required for pyannote speaker-diarization model
+- **Model License**: Must accept pyannote model user agreement
+- **Environment Variable**: `HUGGINGFACE_TOKEN` in .env file
+
+### Technical Implementation
+- **Backend**: pyannote-audio 3.1 with speaker-diarization-3.1 model
+- **Audio Optimization**: Mono conversion, 16kHz resampling, normalization
+- **Confidence Filtering**: Configurable thresholds for segment quality
+- **Memory Management**: Efficient processing with automatic cleanup
+- **Error Handling**: Graceful fallback when diarization fails
+
+### Performance Benefits
+- **Enhanced Accuracy**: Speaker-aware AI processing for better summaries
+- **Meeting Analytics**: Participation metrics and speaking time analysis
+- **Improved Transcripts**: Clear speaker attribution for multi-person meetings
+- **Privacy First**: All voice processing happens locally on your device
+
+### New Files Added
+```
+plaud_processor/
+├── speaker_diarization.py           # Core speaker identification service
+├── test_speakers.py                 # Testing utility for speaker diarization
+├── SPEAKER_DIARIZATION_GUIDE.md     # Comprehensive usage guide
+└── requirements.txt                 # Updated with pyannote-audio
+```
+
+---
+
 ## 🚀 PROJECT STATUS: PRODUCTION READY
 
 ### Current State (July 2025)
@@ -639,6 +716,7 @@ The Plaud Processor is **fully functional and production-ready** with all major 
 - **Model Selection**: `--model` and `--language` parameters for optimal transcription
 - **Verbose Logging**: Clean progress bars vs detailed debugging with `--verbose`
 - **Local Transcription**: Cost-free processing with M2 Mac acceleration
+- **Speaker Diarization**: Interactive speaker identification with `--speakers` flag
 
 **✅ Production Quality:**
 - **Data Loss Prevention**: UTF-8 encoding fixes and recovery mechanisms
@@ -659,6 +737,12 @@ python main.py --monitor --verbose
 
 # Russian transcription with English model for name accuracy
 python main.py --file russian_meeting.mp3 --model medium --language en
+
+# Speaker identification with interactive naming
+python main.py --file meeting.mp3 --speakers
+
+# Full featured meeting processing
+python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
 ```
 
 ---

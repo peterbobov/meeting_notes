@@ -19,6 +19,7 @@ Transform any audio recording into structured, searchable Obsidian notes with AI
 - 🤖 **AI-Powered Processing**: OpenAI Whisper + GPT-4o for superior results
 - 📝 **Intelligent Summaries**: Auto-generated meeting summaries with key decisions
 - ✅ **Smart Action Items**: Extracted tasks with priorities and assignees
+- 👥 **Speaker Diarization**: Interactive speaker identification and naming
 - 🌍 **Multi-language**: Maintains original language (Russian, English, etc.)
 - 📁 **Obsidian Integration**: Direct vault integration with cross-linked files
 - 📊 **Organized Output**: Numbered files for perfect Obsidian organization
@@ -47,6 +48,9 @@ brew install ffmpeg
 # Ubuntu/Debian:
 sudo apt install ffmpeg
 # Windows: Download from https://ffmpeg.org/
+
+# Optional: Install speaker diarization dependencies
+pip install pyannote-audio>=3.1.0
 ```
 
 ### Step 2: Configuration
@@ -60,6 +64,7 @@ cp config.ini.example config.ini
 OPENAI_API_KEY=your_api_key_here                           # Get from OpenAI
 PLAUD_RECORDINGS_PATH=/your_path_to_recordings_here        # Your audio files folder
 OBSIDIAN_VAULT_PATH=/your_path_to_obsidian_vault/Meetings  # Direct Obsidian integration
+HUGGINGFACE_TOKEN=your_huggingface_token_here             # Optional: For speaker diarization
 ```
 
 ### Step 3: Recording & Processing Workflow
@@ -82,6 +87,12 @@ python main.py --file path/to/your/recording.mp3
 
 # Process with custom config
 python main.py --file recording.mp3 --config custom_config.ini
+
+# Process with speaker identification
+python main.py --file meeting.mp3 --speakers
+
+# Process with speaker identification (skip interactive naming)
+python main.py --file meeting.mp3 --speakers --no-interactive
 ```
 
 ### Step 4: Obsidian Integration
@@ -109,7 +120,7 @@ your-obsidian-vault/Meetings/
 
 **File Contents:**
 - **Meta**: Date, duration, participants, language, cross-links
-- **Transcript**: Timestamped transcript in original language  
+- **Transcript**: Timestamped transcript in original language (with speaker labels if --speakers used)
 - **Summary**: Key points, decisions, next steps (same language as transcript)
 - **Action Items**: Categorized by priority with assignees and deadlines
 
@@ -192,6 +203,24 @@ plaud_processor/
 | Audio format issues | Use supported formats: MP3, WAV, M4A, AAC |
 
 ## 🛠️ Advanced Usage
+
+### Speaker Diarization
+Enable speaker identification for multi-person meetings:
+```bash
+# Interactive speaker naming
+python main.py --file meeting.mp3 --speakers
+
+# Skip interactive naming (use default Speaker A, B, C)
+python main.py --file meeting.mp3 --speakers --no-interactive
+
+# Combined with other features
+python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
+```
+
+**Requirements:**
+- Install `pyannote-audio>=3.1.0`
+- Set `HUGGINGFACE_TOKEN` in .env file
+- Accept pyannote model license at https://huggingface.co/pyannote/speaker-diarization-3.1
 
 ### Custom Prompts
 Edit `config.ini` to customize AI processing:
@@ -297,6 +326,10 @@ python main.py --file test.mp3
 python main.py --file test.wav  
 python main.py --file test.m4a
 
+# Test speaker diarization
+python main.py --file meeting.mp3 --speakers
+python main.py --file meeting.mp3 --speakers --no-interactive
+
 # Test error handling
 python main.py --file nonexistent.mp3  # Should handle gracefully
 python main.py --file empty.mp3        # Should detect and skip
@@ -311,6 +344,7 @@ python main.py --config test_config.ini --file test.mp3
 - **95%+ cost savings** - Pay only for what you use
 - **Universal compatibility** - Any audio device works
 - **Better AI** - Latest OpenAI models vs. basic transcription
+- **Speaker identification** - Advanced diarization with interactive naming
 - **Full control** - Your data, your processing, your pace
 - **Obsidian integration** - Seamless knowledge management
 - **Multi-language support** - Maintains original language

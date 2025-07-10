@@ -32,6 +32,9 @@ from local_transcription import LocalTranscriptionService, TranscriptionResult
 # whisper.cpp backend
 from whisper_cpp_backend import WhisperCppService
 
+# Speaker diarization
+from speaker_diarization import SpeakerDiarizationService, InteractiveSpeakerNaming
+
 # Environment
 from dotenv import load_dotenv
 
@@ -569,13 +572,22 @@ class ObsidianGenerator:
         
     def generate_summary_file(self, summary_data: Dict) -> str:
         """Generate meeting_summary.md content."""
+        speaker_section = ""
+        if 'speaker_stats' in summary_data and summary_data['speaker_stats']:
+            speaker_section = "\n## Speaker Statistics\n\n"
+            for speaker, stats in summary_data['speaker_stats'].items():
+                speaker_section += f"**{speaker}:**\n"
+                speaker_section += f"- Speaking time: {stats['total_time']:.1f}s ({stats['percentage']:.1f}%)\n"
+                speaker_section += f"- Segments: {stats['segments']}\n"
+                speaker_section += f"- Average segment: {stats['avg_segment_duration']:.1f}s\n\n"
+        
         template = f"""# Meeting Summary - {summary_data['title']}
 
 **Date:** {summary_data['date']}
 **Tags:** #summary #meeting
 
 {summary_data['summary_content']}
-
+{speaker_section}
 ---
 **Related:** [[1_meeting_meta]] | [[2_meeting_transcript]] | [[4_meeting_action_items]]
 """
@@ -621,7 +633,8 @@ class PlaudProcessor:
     def __init__(self, config_path: str = "config.ini", custom_summary_prompt: Optional[str] = None, \
                  context: Optional[str] = None, generate_action_items: bool = True, \
                  summary_language: Optional[str] = None, transcription_language: Optional[str] = None, \
-                 whisper_model: Optional[str] = None, verbose: bool = False):
+                 whisper_model: Optional[str] = None, verbose: bool = False, \
+                 enable_speakers: bool = False, skip_interactive_naming: bool = False):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
         self.context = context
@@ -630,6 +643,8 @@ class PlaudProcessor:
         self.transcription_language = transcription_language
         self.whisper_model = whisper_model
         self.verbose = verbose
+        self.enable_speakers = enable_speakers
+        self.skip_interactive_naming = skip_interactive_naming
         self.setup_logging()
         
         # Initialize components
@@ -672,6 +687,21 @@ class PlaudProcessor:
                     logging.warning(f"Environment variable {env_var} not found. Using default: {output_folder_str}")
         
         self.obsidian_generator = ObsidianGenerator(output_folder_str)
+        
+        # Initialize speaker diarization service if enabled
+        if self.enable_speakers:
+            try:
+                self.speaker_service = SpeakerDiarizationService(
+                    confidence_threshold=0.7,
+                    min_segment_duration=1.0
+                )
+                logging.info("Speaker diarization service initialized")
+            except ImportError as e:
+                logging.warning(f"Speaker diarization not available: {e}")
+                self.enable_speakers = False
+                self.speaker_service = None
+        else:
+            self.speaker_service = None
         
         # Create input folder if it doesn't exist
         self.audio_processor.input_folder.mkdir(parents=True, exist_ok=True)
@@ -727,6 +757,12 @@ class PlaudProcessor:
             # In non-verbose mode, create a custom filter for cleaner output
             console_handler.addFilter(self._clean_output_filter)
     
+    def _format_time(self, seconds: float) -> str:
+        """Format time in MM:SS format"""
+        minutes = int(seconds // 60)
+        seconds = int(seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+    
     def _clean_output_filter(self, record):
         """
         Filter log records for clean, non-verbose output.
@@ -742,7 +778,7 @@ class PlaudProcessor:
         # So we don't need to filter them here anymore
         
         # Show main pipeline progress
-        if any(phase in message for phase in ['[PIPELINE]', '[VALIDATION]', '[TRANSCRIPTION]', '[AI_PROCESSING]', '[FILE_GENERATION]', '[CLEANUP]']):
+        if any(phase in message for phase in ['[PIPELINE]', '[VALIDATION]', '[TRANSCRIPTION]', '[SPEAKER_DIARIZATION]', '[AI_PROCESSING]', '[FILE_GENERATION]', '[CLEANUP]']):
             # But hide the detailed sub-phases in non-verbose mode
             if any(detail in message.lower() for detail in [
                 'model loaded', 'audio loaded', 'optimization', 'generating meeting title',
@@ -891,6 +927,76 @@ class PlaudProcessor:
                 return False
             
             self.log_progress("TRANSCRIPTION", "Transcription completed successfully")
+            
+            # Phase 3.5: Speaker Diarization (if enabled)
+            if self.enable_speakers and self.speaker_service:
+                self.log_progress("SPEAKER_DIARIZATION", "Performing speaker diarization...")
+                
+                # Perform speaker diarization
+                speaker_result = self.speaker_service.perform_diarization(file_path)
+                
+                if speaker_result.speakers:
+                    self.log_progress("SPEAKER_DIARIZATION", f"Found {len(speaker_result.speakers)} speakers")
+                    
+                    # Create interactive speaker naming workflow
+                    speaker_naming = InteractiveSpeakerNaming(
+                        transcript_data['segments'], 
+                        speaker_result.segments
+                    )
+                    
+                    # Merge transcript with speaker information
+                    merged_segments = speaker_naming.merge_transcript_with_speakers()
+                    
+                    # Get sample quotes for each speaker
+                    sample_quotes = speaker_naming.get_speaker_sample_quotes(merged_segments)
+                    
+                    # Prompt user for speaker names (unless interactive mode is disabled)
+                    speaker_names = speaker_naming.prompt_for_speaker_names(
+                        sample_quotes, 
+                        self.skip_interactive_naming
+                    )
+                    
+                    # Apply speaker names to transcript
+                    updated_segments = speaker_naming.apply_speaker_names(merged_segments, speaker_names)
+                    
+                    # Update transcript data with speaker information
+                    transcript_data['segments'] = updated_segments
+                    transcript_data['speaker_names'] = speaker_names
+                    
+                    # Update speaker stats to use actual names instead of IDs
+                    named_speaker_stats = {}
+                    for speaker_id, stats in speaker_result.speaker_stats.items():
+                        speaker_name = speaker_names.get(speaker_id, speaker_id)
+                        if speaker_name in named_speaker_stats:
+                            # Merge stats if same name was given to multiple speakers
+                            existing_stats = named_speaker_stats[speaker_name]
+                            existing_stats['total_time'] += stats['total_time']
+                            existing_stats['segments'] += stats['segments']
+                            existing_stats['percentage'] = (existing_stats['total_time'] / speaker_result.total_duration) * 100
+                            existing_stats['avg_segment_duration'] = existing_stats['total_time'] / existing_stats['segments']
+                        else:
+                            named_speaker_stats[speaker_name] = stats.copy()
+                    
+                    transcript_data['speaker_stats'] = named_speaker_stats
+                    
+                    # Regenerate transcript text with speaker names for AI processing
+                    speaker_transcript_lines = []
+                    for segment in updated_segments:
+                        speaker = segment.get("speaker", "Unknown")
+                        text = segment.get("text", "").strip()
+                        if text:
+                            # For AI processing, include speaker name without timestamp
+                            speaker_transcript_lines.append(f"{speaker}: {text}")
+                    
+                    # Update the text for AI processing (without timestamps)
+                    transcript_data['text'] = '\n'.join(speaker_transcript_lines)
+                    
+                    # Log that we're using speaker-labeled transcript
+                    logging.info(f"[SPEAKER_DIARIZATION] Transcript updated with speaker names for AI processing")
+                    
+                    self.log_progress("SPEAKER_DIARIZATION", "Speaker identification completed")
+                else:
+                    self.log_progress("SPEAKER_DIARIZATION", "No speakers detected, continuing without speaker info")
                 
             # Phase 4: AI Processing
             self.log_progress("AI_PROCESSING", "Generating AI content...")
@@ -995,9 +1101,22 @@ class PlaudProcessor:
             meeting_folder = self.obsidian_generator.create_meeting_folder(title, date_str)
             
             # Prepare data for file generation
-            formatted_transcript = self.transcription_service.format_transcript_with_timestamps(
-                transcript_data['segments']
-            )
+            # Use speaker-aware formatting if speakers are enabled
+            if self.enable_speakers and 'speaker_names' in transcript_data:
+                # Format transcript with speaker names
+                formatted_lines = []
+                for segment in transcript_data['segments']:
+                    start_time = self._format_time(segment.get("start", 0))
+                    speaker = segment.get("speaker", "Unknown")
+                    text = segment.get("text", "").strip()
+                    if text:
+                        formatted_lines.append(f"[{start_time}] {speaker}: {text}")
+                formatted_transcript = '\n'.join(formatted_lines)
+            else:
+                # Use regular formatting without speakers
+                formatted_transcript = self.transcription_service.format_transcript_with_timestamps(
+                    transcript_data['segments']
+                )
             
             meeting_data = {
                 'title': title,
@@ -1020,7 +1139,8 @@ class PlaudProcessor:
             summary_file_data = {
                 'title': title,
                 'date': date_str,
-                'summary_content': summary
+                'summary_content': summary,
+                'speaker_stats': transcript_data.get('speaker_stats', {})
             }
             
             action_items_file_data = {
@@ -1097,6 +1217,8 @@ if __name__ == "__main__":
     parser.add_argument('--model', help='Override Whisper model (tiny, base, small, medium, large, large-v2, large-v3). Defaults to config setting')
     parser.add_argument('--summary-language', help='Language for summary and action items (e.g., en, ru, es). Defaults to transcript language')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging for debugging (default: clean progress display)')
+    parser.add_argument('--speakers', action='store_true', help='Enable speaker identification and diarization')
+    parser.add_argument('--no-interactive', action='store_true', help='Skip interactive speaker naming (keep default Speaker A, B, C names)')
     
     args = parser.parse_args()
     
@@ -1112,7 +1234,9 @@ if __name__ == "__main__":
             summary_language=getattr(args, 'summary_language', None),
             transcription_language=getattr(args, 'language', None),
             whisper_model=getattr(args, 'model', None),
-            verbose=args.verbose
+            verbose=args.verbose,
+            enable_speakers=args.speakers,
+            skip_interactive_naming=args.no_interactive
         )
         
         if args.file:
@@ -1138,6 +1262,8 @@ if __name__ == "__main__":
             print("  python main.py --monitor")
             print("  python main.py --monitor --config custom_config.ini")
             print("  python main.py --file audio.mp3 --custom-prompt 'Create a technical summary focusing on decisions and blockers'")
+            print("  python main.py --file audio.mp3 --speakers  # Enable speaker identification")
+            print("  python main.py --file audio.mp3 --speakers --no-interactive  # Keep default speaker names")
             
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -1145,3 +1271,4 @@ if __name__ == "__main__":
         print("1. Created a .env file with OPENAI_API_KEY")
         print("2. Copied config.ini.example to config.ini")
         print("3. Installed dependencies: pip install -r requirements.txt")
+        print("4. For speaker diarization: Set HUGGINGFACE_TOKEN in .env and accept pyannote model license")
