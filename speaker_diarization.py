@@ -82,7 +82,10 @@ class InteractiveSpeakerNaming:
         Returns:
             List of transcript segments with speaker IDs
         """
+        logging.info("[SPEAKER_DIARIZATION] Merging transcript segments with speaker information...")
+        
         merged_segments = []
+        speaker_assignments = defaultdict(int)
         
         for transcript_seg in self.transcript_segments:
             transcript_start = transcript_seg.get("start", 0)
@@ -106,12 +109,27 @@ class InteractiveSpeakerNaming:
             merged_segment = transcript_seg.copy()
             merged_segment["speaker"] = assigned_speaker
             merged_segments.append(merged_segment)
+            
+            # Track speaker assignments
+            speaker_assignments[assigned_speaker] += 1
+        
+        # Log speaker assignment summary
+        unique_speakers = list(speaker_assignments.keys())
+        logging.info(f"[SPEAKER_DIARIZATION] Speaker assignment complete:")
+        logging.info(f"[SPEAKER_DIARIZATION] - Total transcript segments: {len(merged_segments)}")
+        logging.info(f"[SPEAKER_DIARIZATION] - Unique speakers in transcript: {len(unique_speakers)}")
+        
+        for speaker_id in sorted(unique_speakers):
+            count = speaker_assignments[speaker_id]
+            percentage = (count / len(merged_segments)) * 100
+            logging.info(f"[SPEAKER_DIARIZATION] - {speaker_id}: {count} segments ({percentage:.1f}%)")
         
         return merged_segments
     
     def get_speaker_sample_quotes(self, merged_segments: List[Dict], max_quote_length: int = 150) -> Dict[str, Tuple[str, str]]:
         """
         Get sample quotes with timestamps for each speaker for identification
+        Prioritizes quotes from early in the meeting (first 5 minutes) for better identification
         
         Args:
             merged_segments: Transcript segments with speaker information
@@ -122,32 +140,55 @@ class InteractiveSpeakerNaming:
         """
         speaker_segments = defaultdict(list)
         
-        # Collect all segments for each speaker
+        # Collect all segments for each speaker, INCLUDING "Unknown" speakers
         for segment in merged_segments:
             speaker_id = segment.get("speaker", "Unknown")
             text = segment.get("text", "").strip()
-            if text and speaker_id != "Unknown":
+            if text:  # Only require text, include ALL speakers including "Unknown"
                 speaker_segments[speaker_id].append(segment)
         
         # Select best sample quote with timestamp for each speaker
+        logging.info("[SPEAKER_DIARIZATION] Selecting sample quotes for speaker identification...")
+        
         sample_quotes = {}
         for speaker_id, segments in speaker_segments.items():
             if segments:
-                # Try to find a good representative quote
+                logging.info(f"[SPEAKER_DIARIZATION] Processing {len(segments)} segments for {speaker_id}")
+                
+                # Sort segments by start time to prioritize early segments
+                segments_sorted = sorted(segments, key=lambda s: s.get("start", 0))
+                
+                # Try to find a good representative quote, prioritizing early segments
                 best_segment = None
                 best_score = -1
+                early_segments_count = sum(1 for s in segments if s.get("start", 0) <= 300)  # First 5 minutes
                 
-                for segment in segments:
+                for segment in segments_sorted:
                     text = segment.get("text", "").strip()
+                    start_time = segment.get("start", 0)
+                    
+                    # Base scoring criteria
                     score = 0
                     
-                    # Scoring criteria
+                    # Heavily prioritize early segments (first 5 minutes = 300 seconds)
+                    if start_time <= 300:  # First 5 minutes
+                        score += 20  # Strong preference for early segments
+                    elif start_time <= 600:  # First 10 minutes
+                        score += 10  # Moderate preference
+                    elif start_time <= 1200:  # First 20 minutes
+                        score += 5   # Slight preference
+                    
+                    # Quality scoring
                     if text.endswith('.') or text.endswith('?') or text.endswith('!'):
                         score += 3  # Complete sentence
                     if 30 <= len(text) <= max_quote_length:
                         score += 2  # Good length
                     if len(text) > 50:
                         score += 1  # Substantial content
+                    
+                    # Penalize very short text
+                    if len(text) < 20:
+                        score -= 2
                     
                     if score > best_score:
                         best_score = score
@@ -167,6 +208,11 @@ class InteractiveSpeakerNaming:
                         text = text[:max_quote_length] + "..."
                     
                     sample_quotes[speaker_id] = (text, timestamp)
+                    
+                    early_note = f" [NOTE: Only speaks late in meeting]" if early_segments_count == 0 else ""
+                    logging.info(f"[SPEAKER_DIARIZATION] - {speaker_id}: Selected quote at {timestamp} (score: {best_score}, early segments: {early_segments_count}){early_note}")
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Sample quote selection complete: {len(sample_quotes)} speakers will be asked for names")
         
         return sample_quotes
     
@@ -192,6 +238,8 @@ class InteractiveSpeakerNaming:
         if skip_interactive:
             logging.info("Skipping interactive speaker naming, keeping default names")
             return speaker_mapping
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Starting interactive speaker naming for {len(sample_quotes)} speakers")
         
         print(f"\nFound {len(sample_quotes)} speakers in this meeting.")
         print("Please provide names for each speaker (press Enter to keep default name):")
@@ -220,14 +268,19 @@ class InteractiveSpeakerNaming:
                     # Map this speaker to the same name as the original
                     speaker_names[speaker_id] = user_input
                     print(f"  → Will merge with previously named '{user_input}'")
+                    logging.info(f"[SPEAKER_DIARIZATION] {speaker_id} ({display_name}) -> '{user_input}' (merged)")
                 else:
                     speaker_names[speaker_id] = user_input
                     entered_names[speaker_id] = user_input
+                    logging.info(f"[SPEAKER_DIARIZATION] {speaker_id} ({display_name}) -> '{user_input}'")
             else:
                 speaker_names[speaker_id] = display_name
                 entered_names[speaker_id] = display_name
+                logging.info(f"[SPEAKER_DIARIZATION] {speaker_id} -> kept default name '{display_name}'")
             
             print()  # Add blank line for readability
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Interactive speaker naming complete: {len(set(speaker_names.values()))} unique names assigned")
         
         return speaker_names
     
@@ -242,17 +295,48 @@ class InteractiveSpeakerNaming:
         Returns:
             Updated transcript segments with speaker names
         """
+        logging.info("[SPEAKER_DIARIZATION] Applying speaker names to transcript segments...")
+        
         updated_segments = []
+        final_speaker_counts = defaultdict(int)
+        unmapped_speakers = set()
         
         for segment in merged_segments:
             updated_segment = segment.copy()
             speaker_id = segment.get("speaker", "Unknown")
             speaker_name = speaker_names.get(speaker_id, speaker_id)
+            
+            if speaker_id not in speaker_names and speaker_id != "Unknown":
+                unmapped_speakers.add(speaker_id)
+                
             updated_segment["speaker"] = speaker_name
             updated_segments.append(updated_segment)
+            
+            # Count final speaker assignments
+            final_speaker_counts[speaker_name] += 1
         
         # Store names for future reference
         self.speaker_names = speaker_names
+        
+        # Log final results
+        logging.info(f"[SPEAKER_DIARIZATION] Speaker name application complete:")
+        logging.info(f"[SPEAKER_DIARIZATION] - Total segments updated: {len(updated_segments)}")
+        logging.info(f"[SPEAKER_DIARIZATION] - Final speaker distribution:")
+        
+        for speaker_name in sorted(final_speaker_counts.keys()):
+            count = final_speaker_counts[speaker_name]
+            percentage = (count / len(updated_segments)) * 100
+            logging.info(f"[SPEAKER_DIARIZATION] - {speaker_name}: {count} segments ({percentage:.1f}%)")
+        
+        if unmapped_speakers:
+            logging.warning(f"[SPEAKER_DIARIZATION] Warning: {len(unmapped_speakers)} speakers not mapped: {list(unmapped_speakers)}")
+        
+        # Check for remaining Unknown speakers
+        if "Unknown" in final_speaker_counts:
+            unknown_count = final_speaker_counts["Unknown"]
+            logging.warning(f"[SPEAKER_DIARIZATION] Warning: {unknown_count} segments still assigned to 'Unknown' speaker")
+        else:
+            logging.info("[SPEAKER_DIARIZATION] Success: All speakers have been identified and named")
         
         return updated_segments
 
