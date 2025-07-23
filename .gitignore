@@ -77,3 +77,10 @@ Thumbs.db
 *.temp
 temp/
 tmp/
+
+# Claude Code assistant files
+CLAUDE.md
+CLAUDE.local.md
+pending_tasks.md
+**/CLAUDE.md
+**/pending_tasks.md
