@@ -63,17 +63,28 @@ class InteractiveSpeakerNaming:
     Interactive workflow for naming speakers based on sample quotes
     """
     
-    def __init__(self, transcript_segments: List[Dict], speaker_segments: List[SpeakerSegment]):
+    def __init__(self, transcript_segments: List[Dict], speaker_segments: List[SpeakerSegment], alignment_tolerance: float = 0.5):
         """
         Initialize interactive speaker naming
         
         Args:
             transcript_segments: List of transcript segments with timestamps
             speaker_segments: List of speaker segments from diarization
+            alignment_tolerance: Time tolerance for timestamp alignment (seconds)
         """
         self.transcript_segments = transcript_segments
         self.speaker_segments = speaker_segments
         self.speaker_names = {}
+        self.alignment_tolerance = alignment_tolerance
+        
+        # Diagnostic counters
+        self.alignment_stats = {
+            'total_segments': 0,
+            'perfect_matches': 0,
+            'tolerance_matches': 0,
+            'no_matches': 0,
+            'timestamp_drift_detected': False
+        }
         
     def merge_transcript_with_speakers(self) -> List[Dict]:
         """
@@ -93,6 +104,8 @@ class InteractiveSpeakerNaming:
             transcript_mid = (transcript_start + transcript_end) / 2
             transcript_duration = transcript_end - transcript_start
             
+            self.alignment_stats['total_segments'] += 1
+            
             # Skip segments with suspicious timestamps (exactly 0 start when others exist)
             if transcript_start == 0 and transcript_end > 0:
                 # Check if there are other segments with non-zero starts
@@ -105,28 +118,64 @@ class InteractiveSpeakerNaming:
             assigned_speaker = "Unknown"
             best_overlap = 0
             best_match_quality = 0
+            perfect_match = False
             
             for speaker_seg in self.speaker_segments:
-                # Check if transcript segment overlaps with speaker segment
+                # Calculate overlaps with alignment tolerance
+                # Standard overlap
                 overlap_start = max(transcript_start, speaker_seg.start_time)
                 overlap_end = min(transcript_end, speaker_seg.end_time)
                 overlap_duration = max(0, overlap_end - overlap_start)
                 
-                # Calculate match quality (prioritize segments that are well contained)
+                # Extended overlap with tolerance
+                tolerance_start = max(transcript_start, speaker_seg.start_time - self.alignment_tolerance)
+                tolerance_end = min(transcript_end, speaker_seg.end_time + self.alignment_tolerance)
+                tolerance_overlap = max(0, tolerance_end - tolerance_start)
+                
+                # Use the better overlap
+                final_overlap = max(overlap_duration, tolerance_overlap)
+                
+                # Track alignment quality
                 if overlap_duration > 0:
+                    perfect_match = True
+                elif tolerance_overlap > overlap_duration:
+                    # Timestamp drift detected
+                    drift = min(
+                        abs(transcript_start - speaker_seg.start_time),
+                        abs(transcript_end - speaker_seg.end_time)
+                    )
+                    if drift > 0.1:  # More than 100ms drift
+                        self.alignment_stats['timestamp_drift_detected'] = True
+                        logging.debug(f"[SPEAKER_DIARIZATION] Timestamp drift detected: {drift:.2f}s for segment at {transcript_start:.1f}s")
+                
+                # Calculate match quality (prioritize segments that are well contained)
+                if final_overlap > 0:
                     # How much of the transcript segment is covered by this speaker?
-                    coverage = overlap_duration / max(0.1, transcript_duration)
+                    coverage = final_overlap / max(0.1, transcript_duration)
                     
                     # Prefer speakers where the transcript is well-contained
-                    match_quality = overlap_duration * coverage
+                    match_quality = final_overlap * coverage
+                    
+                    # Bonus for perfect matches (no tolerance needed)
+                    if overlap_duration > 0 and overlap_duration == final_overlap:
+                        match_quality *= 1.2  # 20% bonus for perfect alignment
                     
                     if match_quality > best_match_quality:
                         best_match_quality = match_quality
-                        best_overlap = overlap_duration
+                        best_overlap = final_overlap
                         assigned_speaker = speaker_seg.speaker_id
+            
+            # Update alignment statistics
+            if perfect_match:
+                self.alignment_stats['perfect_matches'] += 1
+            elif best_overlap > 0:
+                self.alignment_stats['tolerance_matches'] += 1
+            else:
+                self.alignment_stats['no_matches'] += 1
             
             merged_segment = transcript_seg.copy()
             merged_segment["speaker"] = assigned_speaker
+            merged_segment["match_quality"] = best_match_quality  # Store for debugging
             merged_segments.append(merged_segment)
             
             # Track speaker assignments
@@ -137,6 +186,20 @@ class InteractiveSpeakerNaming:
         logging.info(f"[SPEAKER_DIARIZATION] Speaker assignment complete:")
         logging.info(f"[SPEAKER_DIARIZATION] - Total transcript segments: {len(merged_segments)}")
         logging.info(f"[SPEAKER_DIARIZATION] - Unique speakers in transcript: {len(unique_speakers)}")
+        
+        # Log alignment statistics
+        stats = self.alignment_stats
+        perfect_pct = (stats['perfect_matches'] / max(1, stats['total_segments'])) * 100
+        tolerance_pct = (stats['tolerance_matches'] / max(1, stats['total_segments'])) * 100
+        no_match_pct = (stats['no_matches'] / max(1, stats['total_segments'])) * 100
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Timestamp Alignment Quality:")
+        logging.info(f"[SPEAKER_DIARIZATION] - Perfect matches: {stats['perfect_matches']} ({perfect_pct:.1f}%)")
+        logging.info(f"[SPEAKER_DIARIZATION] - Tolerance matches: {stats['tolerance_matches']} ({tolerance_pct:.1f}%)")
+        logging.info(f"[SPEAKER_DIARIZATION] - No matches: {stats['no_matches']} ({no_match_pct:.1f}%)")
+        
+        if stats['timestamp_drift_detected']:
+            logging.warning(f"[SPEAKER_DIARIZATION] ⚠️  Timestamp drift detected! Consider adjusting alignment tolerance.")
         
         for speaker_id in sorted(unique_speakers):
             count = speaker_assignments[speaker_id]
@@ -188,6 +251,7 @@ class InteractiveSpeakerNaming:
                 # Try to find a good representative quote, prioritizing early segments
                 best_segment = None
                 best_score = -1
+                best_purity = 0.0
                 early_segments_count = sum(1 for s in segments if s.get("start", 0) <= 300)  # First 5 minutes
                 
                 for segment in segments_sorted:
@@ -195,9 +259,10 @@ class InteractiveSpeakerNaming:
                     start_time = segment.get("start", 0)
                     end_time = segment.get("end", start_time)
                     
-                    # Check for multi-speaker contamination in this segment
-                    if self._is_multi_speaker_segment(segment, speaker_id, merged_segments):
-                        logging.debug(f"[SPEAKER_DIARIZATION] Skipping multi-speaker segment for {speaker_id}: '{text[:50]}...'")
+                    # Check for multi-speaker contamination and calculate purity score
+                    purity_score = self._calculate_segment_purity(segment, speaker_id, merged_segments)
+                    if purity_score < 0.7:  # Minimum purity threshold
+                        logging.info(f"[SPEAKER_DIARIZATION] ⚠️  REJECTED impure segment for {speaker_id} (purity: {purity_score:.2f}) at {start_time:.1f}s: '{text[:50]}...'")
                         continue
                     
                     # Base scoring criteria
@@ -234,9 +299,13 @@ class InteractiveSpeakerNaming:
                     if start_time > 0.1:  # Allow small floating point errors
                         score += 1
                     
+                    # Major bonus for high purity (clean single-speaker content)
+                    score += (purity_score * 10)  # Up to 10 points for perfect purity
+                    
                     if score > best_score:
                         best_score = score
                         best_segment = segment
+                        best_purity = purity_score
                 
                 if best_segment:
                     text = best_segment.get("text", "").strip()
@@ -254,34 +323,180 @@ class InteractiveSpeakerNaming:
                     sample_quotes[speaker_id] = (text, timestamp)
                     
                     early_note = f" [NOTE: Only speaks late in meeting]" if early_segments_count == 0 else ""
-                    logging.info(f"[SPEAKER_DIARIZATION] - {speaker_id}: Selected quote at {timestamp} (score: {best_score}, early segments: {early_segments_count}){early_note}")
+                    logging.info(f"[SPEAKER_DIARIZATION] - {speaker_id}: Selected quote at {timestamp} (score: {best_score:.1f}, purity: {best_purity:.2f}, early segments: {early_segments_count}){early_note}")
         
         logging.info(f"[SPEAKER_DIARIZATION] Sample quote selection complete: {len(sample_quotes)} speakers will be asked for names")
         
-        return sample_quotes
+        # Perform final validation pass on selected quotes
+        validated_quotes = self._validate_selected_quotes(sample_quotes, merged_segments)
+        
+        return validated_quotes
     
-    def _is_multi_speaker_segment(self, target_segment: Dict, target_speaker: str, all_segments: List[Dict]) -> bool:
+    def _validate_selected_quotes(self, sample_quotes: Dict[str, Tuple[str, str]], merged_segments: List[Dict]) -> Dict[str, Tuple[str, str]]:
         """
-        Check if a transcript segment likely contains speech from multiple speakers
+        Perform final quality validation on selected sample quotes
+        
+        Args:
+            sample_quotes: Dictionary of speaker_id -> (quote, timestamp)
+            merged_segments: All transcript segments for context
+            
+        Returns:
+            Validated sample quotes (may have some removed if quality is too low)
+        """
+        validated_quotes = {}
+        
+        logging.info("[SPEAKER_DIARIZATION] 🔍 Performing quote validation pass...")
+        
+        for speaker_id, (quote, timestamp) in sample_quotes.items():
+            # Parse timestamp back to seconds for analysis
+            time_parts = timestamp.split(':')
+            start_time = int(time_parts[0]) * 60 + int(time_parts[1])
+            
+            # Find the original segment for this quote
+            matching_segment = None
+            for segment in merged_segments:
+                if (segment.get("speaker") == speaker_id and 
+                    abs(segment.get("start", 0) - start_time) < 2 and  # Allow 2 second tolerance
+                    quote[:30] in segment.get("text", "")):
+                    matching_segment = segment
+                    break
+            
+            if not matching_segment:
+                logging.warning(f"[SPEAKER_DIARIZATION] ❌ Could not find matching segment for {speaker_id} quote - removing")
+                continue
+            
+            # Quality validation checks
+            validation_issues = []
+            
+            # Check for conversation markers that indicate multi-speaker interaction
+            interactive_markers = [
+                "да", "нет", "yes", "no", "okay", "хорошо", "понятно", "согласен", "конечно",
+                "right?", "правильно?", "понимаешь?", "знаешь?", "видишь?", "слышишь?"
+            ]
+            quote_lower = quote.lower()
+            if any(marker in quote_lower for marker in interactive_markers) and len(quote) < 80:
+                validation_issues.append("contains interactive markers")
+            
+            # Check for abrupt start/end (might be mid-conversation)
+            if not quote[0].isupper() and not quote.startswith('"') and not quote.startswith('('):
+                validation_issues.append("starts mid-sentence")
+            
+            # Check if quote is too short for reliable identification
+            if len(quote.strip()) < 25:
+                validation_issues.append("too short for identification")
+            
+            # Check for repetitive content (like "uh", "well", etc.)
+            filler_words = ["uh", "um", "well", "так", "вот", "это", "короче", "в общем", "типа"]
+            word_count = len(quote.split())
+            filler_count = sum(1 for word in quote.lower().split() if word in filler_words)
+            if word_count > 0 and (filler_count / word_count) > 0.4:  # >40% filler words
+                validation_issues.append("mostly filler words")
+            
+            # Check segment duration for context
+            duration = matching_segment.get("end", 0) - matching_segment.get("start", 0)
+            if duration > 20:  # Very long segments are suspicious
+                validation_issues.append(f"very long segment ({duration:.1f}s)")
+            
+            # Calculate final validation score
+            validation_score = 1.0 - (len(validation_issues) * 0.2)  # Each issue reduces score by 0.2
+            
+            if validation_issues:
+                issues_str = ", ".join(validation_issues)
+                if validation_score < 0.5:
+                    logging.warning(f"[SPEAKER_DIARIZATION] ❌ FAILED validation for {speaker_id}: {issues_str} (score: {validation_score:.2f})")
+                    continue  # Skip this quote
+                else:
+                    logging.info(f"[SPEAKER_DIARIZATION] ⚠️  Minor issues for {speaker_id}: {issues_str} (score: {validation_score:.2f}) - keeping")
+            else:
+                logging.info(f"[SPEAKER_DIARIZATION] ✅ Passed validation for {speaker_id} (score: {validation_score:.2f})")
+            
+            validated_quotes[speaker_id] = (quote, timestamp)
+        
+        removed_count = len(sample_quotes) - len(validated_quotes)
+        if removed_count > 0:
+            logging.warning(f"[SPEAKER_DIARIZATION] ⚠️  Removed {removed_count} quotes due to quality issues")
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Quote validation complete: {len(validated_quotes)} quotes validated")
+        
+        return validated_quotes
+    
+    def _calculate_segment_purity(self, target_segment: Dict, target_speaker: str, all_segments: List[Dict]) -> float:
+        """
+        Calculate purity score for a segment (0.0 = contaminated, 1.0 = pure)
         
         Args:
             target_segment: The segment to check
             target_speaker: The speaker ID we're checking for
-            all_segments: All merged segments to check for overlaps
+            all_segments: All merged segments to check for context
             
         Returns:
-            True if the segment likely contains multiple speakers
+            Purity score between 0.0 and 1.0
         """
         target_start = target_segment.get("start", 0)
         target_end = target_segment.get("end", target_start)
         target_duration = target_end - target_start
+        target_text = target_segment.get("text", "").strip()
         
-        # Very long segments (>15 seconds) are suspicious for single speaker
+        purity_score = 1.0
+        
+        # Penalize very long segments (likely multi-speaker)
         if target_duration > 15:
-            return True
-            
-        # Count how many different speakers have segments that overlap with this one
-        overlapping_speakers = set()
+            purity_score *= 0.3
+        elif target_duration > 10:
+            purity_score *= 0.7
+        
+        # Penalize very short segments (likely incomplete)
+        if target_duration < 1.0:
+            purity_score *= 0.5
+        
+        # Check for conversation markers that suggest multi-speaker content
+        conversation_markers = [
+            "да", "нет", "yes", "no", "okay", "хорошо", "понятно", "согласен",
+            "what do you think", "что думаешь", "а ты как считаешь", "right?", "правильно?"
+        ]
+        
+        text_lower = target_text.lower()
+        for marker in conversation_markers:
+            if marker in text_lower and len(target_text) < 100:  # Short segments with markers are suspicious
+                purity_score *= 0.6
+                break
+        
+        # Check temporal isolation - how close are other speakers?
+        isolation_score = self._calculate_isolation_score(target_segment, target_speaker, all_segments)
+        purity_score *= isolation_score
+        
+        # Check for overlapping speakers
+        overlap_penalty = self._calculate_overlap_penalty(target_segment, target_speaker, all_segments)
+        purity_score *= overlap_penalty
+        
+        # Bonus for substantial content
+        if len(target_text) > 50 and target_duration > 3:
+            purity_score *= 1.1  # Small bonus for substantial segments
+        
+        final_score = min(1.0, purity_score)  # Cap at 1.0
+        
+        # Debug logging for low purity scores
+        if final_score < 0.8:
+            logging.debug(f"[SPEAKER_DIARIZATION] 🔍 Purity analysis for {target_speaker} at {target_start:.1f}s:")
+            logging.debug(f"  - Duration: {target_duration:.1f}s")
+            logging.debug(f"  - Isolation score: {isolation_score:.2f}")
+            logging.debug(f"  - Overlap penalty: {overlap_penalty:.2f}")
+            logging.debug(f"  - Final purity: {final_score:.2f}")
+            logging.debug(f"  - Text sample: '{target_text[:60]}{'...' if len(target_text) > 60 else ''}'")
+        
+        return final_score
+    
+    def _calculate_isolation_score(self, target_segment: Dict, target_speaker: str, all_segments: List[Dict]) -> float:
+        """
+        Calculate how isolated a segment is from other speakers
+        
+        Returns:
+            Score from 0.5 (crowded) to 1.0 (well isolated)
+        """
+        target_start = target_segment.get("start", 0)
+        target_end = target_segment.get("end", target_start)
+        
+        min_distance_to_other = float('inf')
         
         for segment in all_segments:
             if segment == target_segment:
@@ -291,17 +506,83 @@ class InteractiveSpeakerNaming:
             seg_end = segment.get("end", seg_start)
             seg_speaker = segment.get("speaker", "Unknown")
             
-            # Check for temporal overlap
-            overlap_start = max(target_start, seg_start)
-            overlap_end = min(target_end, seg_end)
-            overlap_duration = max(0, overlap_end - overlap_start)
-            
-            # If there's significant overlap with a different speaker, it's suspicious
-            if overlap_duration > 0.5 and seg_speaker != target_speaker:  # 0.5 second overlap threshold
-                overlapping_speakers.add(seg_speaker)
+            if seg_speaker != target_speaker:
+                # Calculate distance to this other speaker's segment
+                if seg_end <= target_start:
+                    distance = target_start - seg_end
+                elif seg_start >= target_end:
+                    distance = seg_start - target_end
+                else:
+                    distance = 0  # Overlapping
+                
+                min_distance_to_other = min(min_distance_to_other, distance)
         
-        # If multiple other speakers overlap significantly, this segment is contaminated
-        return len(overlapping_speakers) >= 1
+        # Convert distance to isolation score
+        if min_distance_to_other == float('inf'):
+            isolation_score = 1.0  # No other speakers
+            isolation_label = "perfect"
+        elif min_distance_to_other >= 3.0:
+            isolation_score = 1.0  # Well isolated (3+ second gap)
+            isolation_label = f"well isolated ({min_distance_to_other:.1f}s gap)"
+        elif min_distance_to_other >= 1.0:
+            isolation_score = 0.9  # Good isolation (1+ second gap)
+            isolation_label = f"good isolation ({min_distance_to_other:.1f}s gap)"
+        elif min_distance_to_other > 0:
+            isolation_score = 0.7  # Some isolation
+            isolation_label = f"some isolation ({min_distance_to_other:.1f}s gap)"
+        else:
+            isolation_score = 0.5  # Overlapping with other speakers
+            isolation_label = "overlapping with others"
+        
+        # Log isolation details for segments with low isolation
+        if isolation_score < 0.9:
+            logging.debug(f"[SPEAKER_DIARIZATION] 🔍 Isolation for {target_speaker} at {target_start:.1f}s: {isolation_label} (score: {isolation_score:.2f})")
+        
+        return isolation_score
+    
+    def _calculate_overlap_penalty(self, target_segment: Dict, target_speaker: str, all_segments: List[Dict]) -> float:
+        """
+        Calculate penalty for overlapping with other speakers
+        
+        Returns:
+            Penalty multiplier from 0.3 (heavily overlapping) to 1.0 (no overlap)
+        """
+        target_start = target_segment.get("start", 0)
+        target_end = target_segment.get("end", target_start)
+        target_duration = target_end - target_start
+        
+        total_overlap = 0.0
+        
+        for segment in all_segments:
+            if segment == target_segment:
+                continue
+                
+            seg_start = segment.get("start", 0)
+            seg_end = segment.get("end", seg_start)
+            seg_speaker = segment.get("speaker", "Unknown")
+            
+            if seg_speaker != target_speaker:
+                # Calculate overlap with this other speaker
+                overlap_start = max(target_start, seg_start)
+                overlap_end = min(target_end, seg_end)
+                overlap_duration = max(0, overlap_end - overlap_start)
+                total_overlap += overlap_duration
+        
+        # Calculate overlap percentage
+        if target_duration <= 0:
+            return 1.0
+            
+        overlap_percentage = total_overlap / target_duration
+        
+        # Convert to penalty
+        if overlap_percentage <= 0.1:
+            return 1.0  # No significant overlap
+        elif overlap_percentage <= 0.3:
+            return 0.8  # Some overlap
+        elif overlap_percentage <= 0.5:
+            return 0.6  # Moderate overlap
+        else:
+            return 0.3  # Heavy overlap
     
     def prompt_for_speaker_names(self, sample_quotes: Dict[str, Tuple[str, str]], skip_interactive: bool = False) -> Dict[str, str]:
         """
