@@ -1,0 +1,18 @@
+{
+  "name": "Default Meeting",
+  "description": "Standard meeting format with summary and action items",
+  "files": {
+    "summary": {
+      "enabled": true,
+      "filename": "3_meeting_summary.md",
+      "prompt": "You are a meeting assistant. Analyze this transcript and create a concise summary focusing on key decisions, main topics discussed, and important insights. Format as markdown with clear sections for Key Points, Decisions Made, and Next Steps. Always preserve the original language context of the meeting unless explicitly instructed otherwise.",
+      "template": "# Meeting Summary - {title}\n\n**Date:** {date}\n**Tags:** #summary #meeting\n\n## Key Points\n{key_points}\n\n## Decisions Made\n{decisions}\n\n## Next Steps\n{next_steps}\n\n---\n**Related:** [[1_meeting_meta]] | [[2_meeting_transcript]] | [[4_meeting_action_items]]"
+    },
+    "action_items": {
+      "enabled": true,
+      "filename": "4_meeting_action_items.md",
+      "prompt": "Extract action items from this meeting transcript. For each action item, identify: 1) The specific task, 2) Who should do it (if mentioned), 3) Any deadlines or timeframes mentioned. Organize by priority (High, Medium, Low) and format as markdown with checkboxes. If no assignee is mentioned, use \"Unassigned\". Include context details when helpful. Always preserve the original language context unless explicitly instructed otherwise.",
+      "template": "# Action Items - {title}\n\n**Date:** {date}\n**Tags:** #actionitems #meeting #tasks\n\n## Action Items\n\n{action_items_content}\n\n---\n**Related:** [[1_meeting_meta]] | [[2_meeting_transcript]] | [[3_meeting_summary]]"
+    }
+  }
+}

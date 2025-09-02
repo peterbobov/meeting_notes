@@ -78,6 +78,10 @@ Thumbs.db
 temp/
 tmp/
 
+# Templates (exclude user-specific templates, keep defaults)
+templates/*.json
+!templates/default.json
+
 # Claude Code assistant files
 CLAUDE.md
 CLAUDE.local.md

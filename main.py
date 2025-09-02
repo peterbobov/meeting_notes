@@ -18,6 +18,7 @@ import shutil
 import re
 import sys
 import threading
+import glob
 
 # Audio processing
 import librosa
@@ -377,22 +378,71 @@ class HybridTranscriptionService:
             }
 
 
+class TemplateManager:
+    """Manages meeting processing templates."""
+    
+    def __init__(self, templates_dir: str = "templates"):
+        self.templates_dir = Path(templates_dir)
+        
+    def load_template(self, template_name: str) -> Dict:
+        """Load a template configuration from file."""
+        template_path = self.templates_dir / f"{template_name}.json"
+        
+        if not template_path.exists():
+            raise FileNotFoundError(f"Template '{template_name}' not found at {template_path}")
+        
+        try:
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template = json.load(f)
+            self._validate_template(template)
+            return template
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in template '{template_name}': {e}")
+    
+    def list_templates(self) -> List[str]:
+        """List all available templates."""
+        if not self.templates_dir.exists():
+            return []
+        
+        templates = []
+        for template_file in self.templates_dir.glob("*.json"):
+            templates.append(template_file.stem)
+        return sorted(templates)
+    
+    def _validate_template(self, template: Dict) -> None:
+        """Validate template structure."""
+        required_fields = ['name', 'description', 'files']
+        for field in required_fields:
+            if field not in template:
+                raise ValueError(f"Template missing required field: {field}")
+        
+        if not isinstance(template['files'], dict):
+            raise ValueError("Template 'files' must be a dictionary")
+        
+        for file_key, file_config in template['files'].items():
+            if not isinstance(file_config, dict):
+                raise ValueError(f"File config for '{file_key}' must be a dictionary")
+            if 'enabled' not in file_config:
+                raise ValueError(f"File config for '{file_key}' missing 'enabled' field")
+
+
 class AIProcessor:
     """Handles AI processing for summaries and action items using GPT-4o."""
     
     def __init__(self, api_key: str):
         self.client = OpenAI(api_key=api_key)
         
-    def generate_summary(self, transcript: str, prompt: str, context: Optional[str] = None, target_language: Optional[str] = None) -> str:
-        """Generate meeting summary using GPT-4o."""
+    def process_with_template(self, transcript: str, file_config: Dict, context: Optional[str] = None, target_language: Optional[str] = None) -> str:
+        """Process transcript using template configuration."""
         try:
+            prompt = file_config.get('prompt', '')
+            
             # Create the user message with optional context and language specification
-            user_message = "Please analyze this meeting transcript and create a summary:"
+            user_message = f"Please analyze this meeting transcript:\n\n{transcript}"
             if context:
-                user_message = f"Context: {context}\n\nPlease analyze this meeting transcript and create a summary based on the provided context:"
+                user_message = f"Context: {context}\n\n{prompt}\n\nTranscript:\n{transcript}"
             if target_language:
-                user_message += f"\n\nIMPORTANT: Please write the summary in {target_language}, regardless of the transcript language."
-            user_message += f"\n\n{transcript}"
+                user_message += f"\n\nIMPORTANT: Please respond in {target_language}, regardless of the transcript language."
             
             response = self.client.chat.completions.create(
                 model="gpt-4o",
@@ -400,14 +450,19 @@ class AIProcessor:
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=1000,
+                max_tokens=2000,
                 temperature=0.3
             )
             return response.choices[0].message.content
             
         except Exception as e:
-            logging.error(f"Error generating summary: {e}")
-            return f"Error generating summary: {e}"
+            logging.error(f"Error processing with template: {e}")
+            return f"Error processing with template: {e}"
+    
+    def generate_summary(self, transcript: str, prompt: str, context: Optional[str] = None, target_language: Optional[str] = None) -> str:
+        """Generate meeting summary using GPT-4o (legacy method)."""
+        file_config = {'prompt': prompt}
+        return self.process_with_template(transcript, file_config, context, target_language)
             
     def extract_action_items(self, transcript: str, prompt: str, target_language: Optional[str] = None) -> str:
         """Extract and format action items using GPT-4o."""
@@ -522,15 +577,26 @@ class ObsidianGenerator:
         
         return folder_path
         
-    def generate_meta_file(self, meeting_data: Dict, include_action_items: bool = True) -> str:
-        """Generate meeting_meta.md content."""
+    def generate_meta_file(self, meeting_data: Dict, template_files: Dict = None) -> str:
+        """Generate meeting_meta.md content with template-based navigation."""
         navigation_links = [
-            "- [[2_meeting_transcript]] - Full transcript with timestamps",
-            "- [[3_meeting_summary]] - Key points and decisions"
+            "- [[2_meeting_transcript]] - Full transcript with timestamps"
         ]
         
-        if include_action_items:
-            navigation_links.append("- [[4_meeting_action_items]] - Tasks and follow-ups")
+        # Add navigation links based on template configuration
+        if template_files:
+            for file_key, file_config in template_files.items():
+                if file_config.get('enabled', False) and file_key not in ['transcript']:
+                    filename = file_config.get('filename', f'{file_key}.md')
+                    # Extract number and name from filename for navigation
+                    file_base = filename.replace('.md', '')
+                    navigation_links.append(f"- [[{file_base}]] - {file_config.get('description', file_key)}")
+        else:
+            # Default navigation (backward compatibility)
+            navigation_links.extend([
+                "- [[3_meeting_summary]] - Key points and decisions",
+                "- [[4_meeting_action_items]] - Tasks and follow-ups"
+            ])
         
         navigation_section = "\n".join(navigation_links)
         
@@ -607,23 +673,48 @@ class ObsidianGenerator:
 """
         return template
         
-    def write_files(self, folder_path: Path, file_contents: Dict, write_action_items: bool = True):
+    def generate_template_file(self, file_config: Dict, content: str, meeting_data: Dict) -> str:
+        """Generate a template-based file using the file configuration."""
+        template_format = file_config.get('template', '{content}')
+        
+        # Replace placeholders in template
+        result = template_format.format(
+            title=meeting_data.get('title', ''),
+            date=meeting_data.get('date', ''),
+            analysis_content=content,
+            content=content
+        )
+        
+        return result
+    
+    def write_files(self, folder_path: Path, file_contents: Dict, template_files: Dict = None):
         """Write all markdown files to the meeting folder."""
         files_to_write = {
             '1_meeting_meta.md': file_contents['meta'],
-            '2_meeting_transcript.md': file_contents['transcript'],
-            '3_meeting_summary.md': file_contents['summary']
+            '2_meeting_transcript.md': file_contents['transcript']
         }
         
-        # Only include action items file if requested
-        if write_action_items and 'action_items' in file_contents:
-            files_to_write['4_meeting_action_items.md'] = file_contents['action_items']
+        # Add template-based files or use defaults
+        if template_files:
+            for file_key, file_config in template_files.items():
+                if file_config.get('enabled', False) and file_key in file_contents:
+                    filename = file_config.get('filename', f'{file_key}.md')
+                    files_to_write[filename] = file_contents[file_key]
+        else:
+            # Default backward compatibility
+            files_to_write.update({
+                '3_meeting_summary.md': file_contents.get('summary', ''),
+                '4_meeting_action_items.md': file_contents.get('action_items', '')
+            })
         
+        # Write files
         for filename, content in files_to_write.items():
-            file_path = folder_path / filename
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-                
+            if content:  # Only write non-empty files
+                file_path = folder_path / filename
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                logging.info(f"Created: {file_path}")
+        
         logging.info(f"Created meeting files in: {folder_path}")
 
 
@@ -634,7 +725,8 @@ class PlaudProcessor:
                  context: Optional[str] = None, generate_action_items: bool = True, \
                  summary_language: Optional[str] = None, transcription_language: Optional[str] = None, \
                  whisper_model: Optional[str] = None, verbose: bool = False, \
-                 enable_speakers: bool = False, skip_interactive_naming: bool = False):
+                 enable_speakers: bool = False, skip_interactive_naming: bool = False, \
+                 template_name: Optional[str] = None):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
         self.context = context
@@ -645,6 +737,7 @@ class PlaudProcessor:
         self.verbose = verbose
         self.enable_speakers = enable_speakers
         self.skip_interactive_naming = skip_interactive_naming
+        self.template_name = template_name
         self.setup_logging()
         
         # Initialize components
@@ -687,6 +780,17 @@ class PlaudProcessor:
                     logging.warning(f"Environment variable {env_var} not found. Using default: {output_folder_str}")
         
         self.obsidian_generator = ObsidianGenerator(output_folder_str)
+        self.template_manager = TemplateManager()
+        
+        # Load template if specified
+        self.template = None
+        if self.template_name:
+            try:
+                self.template = self.template_manager.load_template(self.template_name)
+                logging.info(f"Using template: {self.template['name']}")
+            except Exception as e:
+                logging.error(f"Failed to load template '{self.template_name}': {e}")
+                raise
         
         # Initialize speaker diarization service if enabled
         if self.enable_speakers:
@@ -1070,24 +1174,43 @@ class PlaudProcessor:
             # Add debug logging to see what language is being detected
             logging.info(f"Language detection: detected='{detected_language}', target='{target_language}', mapped='{target_language_name}'")
             
-            self.log_progress("AI_PROCESSING", f"Generating summary in {target_language_name}...")
-            summary = self.ai_processor.generate_summary(
-                transcript_data['text'], 
-                summary_prompt,
-                self.context,
-                target_language_name
-            )
+            # Process with template if specified, otherwise use default behavior
+            processed_content = {}
             
-            # Only generate action items if requested
-            if self.generate_action_items:
-                self.log_progress("AI_PROCESSING", "Extracting action items...")
-                action_items = self.ai_processor.extract_action_items(
+            if self.template:
+                # Use template-based processing
+                self.log_progress("AI_PROCESSING", f"Processing with template: {self.template['name']}")
+                
+                for file_key, file_config in self.template['files'].items():
+                    if file_config.get('enabled', False):
+                        self.log_progress("AI_PROCESSING", f"Generating {file_key}...")
+                        content = self.ai_processor.process_with_template(
+                            transcript_data['text'],
+                            file_config,
+                            self.context,
+                            target_language_name
+                        )
+                        processed_content[file_key] = content
+            else:
+                # Default processing (backward compatibility)
+                self.log_progress("AI_PROCESSING", f"Generating summary in {target_language_name}...")
+                summary = self.ai_processor.generate_summary(
                     transcript_data['text'], 
-                    prompts['action_items_prompt'],
+                    summary_prompt,
+                    self.context,
                     target_language_name
                 )
-            else:
-                action_items = "Action items generation disabled for this meeting."
+                processed_content['summary'] = summary
+                
+                # Only generate action items if requested
+                if self.generate_action_items:
+                    self.log_progress("AI_PROCESSING", "Extracting action items...")
+                    action_items = self.ai_processor.extract_action_items(
+                        transcript_data['text'], 
+                        prompts['action_items_prompt'],
+                        target_language_name
+                    )
+                    processed_content['action_items'] = action_items
             
             self.log_progress("AI_PROCESSING", "Detecting participants...")
             participants = self.ai_processor.detect_participants(
@@ -1136,34 +1259,60 @@ class PlaudProcessor:
                 'formatted_transcript': formatted_transcript
             }
             
-            summary_file_data = {
-                'title': title,
-                'date': date_str,
-                'summary_content': summary,
-                'speaker_stats': transcript_data.get('speaker_stats', {})
-            }
-            
-            action_items_file_data = {
-                'title': title,
-                'date': date_str,
-                'action_items_content': action_items
-            }
-            
             # Generate file contents
             self.log_progress("FILE_GENERATION", "Generating markdown files...")
+            
+            # Base files (always generated)
             files_content = {
-                'meta': self.obsidian_generator.generate_meta_file(meeting_data, self.generate_action_items),
-                'transcript': self.obsidian_generator.generate_transcript_file(transcript_file_data),
-                'summary': self.obsidian_generator.generate_summary_file(summary_file_data)
+                'transcript': self.obsidian_generator.generate_transcript_file(transcript_file_data)
             }
             
-            # Only include action items in files_content if they're being generated
-            if self.generate_action_items:
-                files_content['action_items'] = self.obsidian_generator.generate_action_items_file(action_items_file_data)
+            if self.template:
+                # Template-based file generation
+                template_files = self.template['files']
+                
+                # Generate meta file with template navigation
+                files_content['meta'] = self.obsidian_generator.generate_meta_file(meeting_data, template_files)
+                
+                # Generate template-based files
+                for file_key, file_config in template_files.items():
+                    if file_config.get('enabled', False) and file_key in processed_content:
+                        content = processed_content[file_key]
+                        # Use template formatting if available
+                        if 'template' in file_config:
+                            content = self.obsidian_generator.generate_template_file(
+                                file_config, content, meeting_data
+                            )
+                        files_content[file_key] = content
+                        
+                # Write files with template configuration
+                self.obsidian_generator.write_files(meeting_folder, files_content, template_files)
+            else:
+                # Default file generation (backward compatibility)
+                summary_file_data = {
+                    'title': title,
+                    'date': date_str,
+                    'summary_content': processed_content.get('summary', ''),
+                    'speaker_stats': transcript_data.get('speaker_stats', {})
+                }
+                
+                files_content.update({
+                    'meta': self.obsidian_generator.generate_meta_file(meeting_data),
+                    'summary': self.obsidian_generator.generate_summary_file(summary_file_data)
+                })
+                
+                if 'action_items' in processed_content:
+                    action_items_file_data = {
+                        'title': title,
+                        'date': date_str,
+                        'action_items_content': processed_content['action_items']
+                    }
+                    files_content['action_items'] = self.obsidian_generator.generate_action_items_file(action_items_file_data)
+                
+                # Write files with default behavior
+                self.obsidian_generator.write_files(meeting_folder, files_content)
             
-            # Write files
             self.log_progress("FILE_GENERATION", "Writing files to disk...")
-            self.obsidian_generator.write_files(meeting_folder, files_content, self.generate_action_items)
             
             # Phase 6: Cleanup
             self.log_progress("CLEANUP", "Archiving processed file...")
@@ -1219,8 +1368,31 @@ if __name__ == "__main__":
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging for debugging (default: clean progress display)')
     parser.add_argument('--speakers', action='store_true', help='Enable speaker identification and diarization')
     parser.add_argument('--no-interactive', action='store_true', help='Skip interactive speaker naming (keep default Speaker A, B, C names)')
+    parser.add_argument('--template', help='Use a specific template for processing (e.g., ai_committee, interview, standup)')
+    parser.add_argument('--list-templates', action='store_true', help='List all available templates')
     
     args = parser.parse_args()
+    
+    # Handle list templates request
+    if args.list_templates:
+        template_manager = TemplateManager()
+        templates = template_manager.list_templates()
+        
+        print("Available Templates:")
+        print("=" * 40)
+        
+        if not templates:
+            print("No templates found in templates/ directory")
+        else:
+            for template_name in templates:
+                try:
+                    template = template_manager.load_template(template_name)
+                    print(f"• {template_name:15} - {template.get('description', 'No description')}")
+                except Exception as e:
+                    print(f"• {template_name:15} - Error loading: {e}")
+        
+        print("\nUsage: python main.py --template <template_name> --file <audio_file>")
+        sys.exit(0)
     
     print("Plaud Pin to Obsidian Processor")
     print("=" * 40)
@@ -1236,7 +1408,8 @@ if __name__ == "__main__":
             whisper_model=getattr(args, 'model', None),
             verbose=args.verbose,
             enable_speakers=args.speakers,
-            skip_interactive_naming=args.no_interactive
+            skip_interactive_naming=args.no_interactive,
+            template_name=getattr(args, 'template', None)
         )
         
         if args.file:
