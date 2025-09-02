@@ -20,6 +20,14 @@ The Plaud Processor now includes speaker diarization capabilities, allowing you 
 - **Security**: Voice biometric data never leaves your device
 - **Efficient**: Parallel processing with existing transcription pipeline
 
+### 🆕 Quality Improvements (Latest Update)
+- **Timestamp Alignment Tolerance**: ±0.5s tolerance for audio processing drift compensation
+- **Purity Scoring Algorithm**: Detects and rejects multi-speaker contaminated segments
+- **Isolation Scoring**: Analyzes temporal separation between different speakers
+- **Quote Validation Pass**: Final quality assurance with conversation marker detection
+- **Comprehensive Diagnostic Logging**: Detailed debug output for troubleshooting
+- **Chronological Prioritization**: Early meeting segments preferred for cleaner identification
+
 ## Installation & Setup
 
 ### 1. Install Dependencies
@@ -237,6 +245,26 @@ Speakers incorrectly merged or split
 - Check microphone placement
 - Adjust confidence threshold
 
+#### 5. Multi-Speaker Quote Contamination (Fixed in Latest Update)
+```
+Quote snippets contain quotes from multiple speakers
+```
+**Now Automatically Handled**:
+- Purity scoring algorithm detects contaminated segments
+- Isolation scoring analyzes speaker separation
+- Quote validation pass removes problematic quotes
+- Enhanced logging shows rejection reasons
+
+#### 6. Timestamp Drift Issues (Fixed in Latest Update)  
+```
+Speaker marked as speaking from 00:00 but started later
+```
+**Now Automatically Handled**:
+- ±0.5s alignment tolerance compensates for processing drift
+- Timestamp validation detects suspicious 00:00 segments
+- Diagnostic logging tracks alignment quality
+- Fallback mechanisms for drift recovery
+
 ### Performance Optimization
 
 #### For Best Results:
@@ -249,6 +277,41 @@ Speakers incorrectly merged or split
 - **Parallel Processing**: Diarization runs alongside transcription
 - **M2 Acceleration**: Automatically uses Metal Performance Shaders
 - **Memory Management**: Automatic cleanup and garbage collection
+
+### Enhanced Debugging (Latest Update)
+
+The latest version includes comprehensive diagnostic logging to help troubleshoot speaker identification issues:
+
+#### Enable Verbose Logging
+```bash
+# Get detailed debug output for speaker diarization
+python main.py --file meeting.mp3 --speakers --verbose
+```
+
+#### What the Enhanced Logging Shows:
+- **Timestamp Alignment Statistics**: Perfect vs tolerance-based matches
+- **Purity Analysis**: Why segments are rejected for contamination
+- **Isolation Scoring**: How well speakers are separated temporally
+- **Quote Selection Process**: Scoring breakdown for sample quotes
+- **Validation Results**: Quality checks on selected quotes
+
+#### Sample Debug Output:
+```
+[SPEAKER_DIARIZATION] Timestamp Alignment Quality:
+[SPEAKER_DIARIZATION] - Perfect matches: 156 (78.4%)
+[SPEAKER_DIARIZATION] - Tolerance matches: 32 (16.1%)
+[SPEAKER_DIARIZATION] - No matches: 11 (5.5%)
+
+[SPEAKER_DIARIZATION] ⚠️  REJECTED impure segment for SPEAKER_01 (purity: 0.45) at 125.3s: 'да, согласен, но нужно учесть...'
+
+[SPEAKER_DIARIZATION] 🔍 Purity analysis for SPEAKER_02 at 89.7s:
+  - Duration: 12.4s
+  - Isolation score: 0.70
+  - Overlap penalty: 0.85
+  - Final purity: 0.82
+
+[SPEAKER_DIARIZATION] ✅ Passed validation for SPEAKER_01 (score: 1.00)
+```
 
 ## Integration with Existing Workflow
 
