@@ -427,10 +427,23 @@ class TemplateManager:
 
 
 class AIProcessor:
-    """Handles AI processing for summaries and action items using GPT-4o."""
+    """Handles AI processing for summaries and action items using OpenAI GPT-4o or YandexGPT."""
     
-    def __init__(self, api_key: str):
-        self.client = OpenAI(api_key=api_key)
+    def __init__(self, api_key: str, provider: str = "openai", yandex_folder_id: Optional[str] = None):
+        self.provider = provider
+        
+        if provider == "yandex" and yandex_folder_id:
+            # Initialize YandexGPT through OpenAI compatibility
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url="https://llm.api.cloud.yandex.net/v1"
+            )
+            self.yandex_folder_id = yandex_folder_id
+            self.model_name = f"gpt://{yandex_folder_id}/yandexgpt/latest"
+        else:
+            # Use OpenAI
+            self.client = OpenAI(api_key=api_key)
+            self.model_name = "gpt-4o"
         
     def process_with_template(self, transcript: str, file_config: Dict, context: Optional[str] = None, target_language: Optional[str] = None) -> str:
         """Process transcript using template configuration."""
@@ -445,7 +458,7 @@ class AIProcessor:
                 user_message += f"\n\nIMPORTANT: Please respond in {target_language}, regardless of the transcript language."
             
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_message}
@@ -472,7 +485,7 @@ class AIProcessor:
                 user_message += f"\n\nIMPORTANT: Please write the action items in {target_language}, regardless of the transcript language."
             
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_message}
@@ -490,7 +503,7 @@ class AIProcessor:
         """Generate appropriate meeting title from content."""
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": f"Generate a meeting title for this transcript:\n\n{transcript[:1000]}..."}
@@ -508,7 +521,7 @@ class AIProcessor:
         """Attempt to identify meeting participants."""
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": f"Identify participants in this transcript:\n\n{transcript}"}
@@ -540,7 +553,7 @@ IMPORTANT RULES:
 Original transcript:"""
 
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=self.model_name,
                 messages=[
                     {"role": "system", "content": "You are a professional translator specializing in meeting transcripts. You preserve names and timestamps while providing accurate translations."},
                     {"role": "user", "content": f"{prompt}\n\n{transcript}"}
@@ -726,7 +739,7 @@ class PlaudProcessor:
                  summary_language: Optional[str] = None, transcription_language: Optional[str] = None, \
                  whisper_model: Optional[str] = None, verbose: bool = False, \
                  enable_speakers: bool = False, skip_interactive_naming: bool = False, \
-                 template_name: Optional[str] = None):
+                 template_name: Optional[str] = None, ai_provider: Optional[str] = None):
         self.config = self.load_config(config_path)
         self.custom_summary_prompt = custom_summary_prompt
         self.context = context
@@ -741,10 +754,6 @@ class PlaudProcessor:
         self.setup_logging()
         
         # Initialize components
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            raise ValueError("OpenAI API key not found. Please set OPENAI_API_KEY in your .env file")
-            
         self.audio_processor = AudioProcessor(self.config)
         
         # Use local transcription by default, with API fallback
@@ -758,12 +767,48 @@ class PlaudProcessor:
         if local_model:
             logging.info(f"Using Whisper model: {local_model}")
         
-        self.transcription_service = HybridTranscriptionService(
-            api_key=api_key,
-            use_local=use_local,
-            local_model=local_model
-        )
-        self.ai_processor = AIProcessor(api_key)
+        # Initialize AI processor with provider detection
+        # CLI override takes precedence over environment variable
+        ai_provider = (ai_provider or os.getenv('AI_PROVIDER', 'openai')).lower()
+        
+        if ai_provider == 'yandex':
+            # YandexGPT configuration
+            yandex_api_key = os.getenv('YANDEX_API_KEY')
+            yandex_folder_id = os.getenv('YANDEX_FOLDER_ID')
+            
+            if not yandex_api_key or not yandex_folder_id:
+                raise ValueError("YandexGPT selected but YANDEX_API_KEY or YANDEX_FOLDER_ID not found in .env file")
+            
+            # Still need OpenAI key for transcription fallback
+            openai_api_key = os.getenv('OPENAI_API_KEY')
+            if not openai_api_key:
+                logging.warning("OpenAI API key not found. Transcription will only work in local mode.")
+                openai_api_key = "dummy-key"  # Dummy key for local-only usage
+            
+            self.transcription_service = HybridTranscriptionService(
+                api_key=openai_api_key,
+                use_local=use_local,
+                local_model=local_model
+            )
+            self.ai_processor = AIProcessor(
+                api_key=yandex_api_key,
+                provider='yandex',
+                yandex_folder_id=yandex_folder_id
+            )
+            logging.info(f"Using YandexGPT for AI processing (folder: {yandex_folder_id})")
+        else:
+            # OpenAI configuration
+            api_key = os.getenv('OPENAI_API_KEY')
+            if not api_key:
+                raise ValueError("OpenAI API key not found. Please set OPENAI_API_KEY in your .env file")
+            
+            self.transcription_service = HybridTranscriptionService(
+                api_key=api_key,
+                use_local=use_local,
+                local_model=local_model
+            )
+            self.ai_processor = AIProcessor(api_key)
+            logging.info("Using OpenAI GPT-4o for AI processing")
         
         # Handle environment variable substitution for output folder
         output_folder_str = self.config['PATHS'].get('output_folder', './meeting_data')
@@ -1370,6 +1415,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-interactive', action='store_true', help='Skip interactive speaker naming (keep default Speaker A, B, C names)')
     parser.add_argument('--template', help='Use a specific template for processing (e.g., ai_committee, interview, standup)')
     parser.add_argument('--list-templates', action='store_true', help='List all available templates')
+    parser.add_argument('--ai-provider', choices=['openai', 'yandex'], help='Override AI provider (openai or yandex). Defaults to AI_PROVIDER environment variable or openai')
     
     args = parser.parse_args()
     
@@ -1409,7 +1455,8 @@ if __name__ == "__main__":
             verbose=args.verbose,
             enable_speakers=args.speakers,
             skip_interactive_naming=args.no_interactive,
-            template_name=getattr(args, 'template', None)
+            template_name=getattr(args, 'template', None),
+            ai_provider=getattr(args, 'ai_provider', None)
         )
         
         if args.file:

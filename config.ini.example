@@ -2,6 +2,11 @@
 # OpenAI API key will be loaded from .env file
 # No need to set it here - use environment variable OPENAI_API_KEY
 
+# YandexGPT settings (optional) - loaded from .env file
+# YANDEX_API_KEY - Yandex Cloud API key
+# YANDEX_FOLDER_ID - Yandex Cloud folder ID
+# AI_PROVIDER - openai or yandex (default: openai)
+
 [PATHS]
 # Input folder to monitor for Plaud recordings
 # Use ${PLAUD_RECORDINGS_PATH} to reference environment variable

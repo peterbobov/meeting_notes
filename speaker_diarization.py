@@ -91,10 +91,20 @@ class InteractiveSpeakerNaming:
             transcript_start = transcript_seg.get("start", 0)
             transcript_end = transcript_seg.get("end", 0)
             transcript_mid = (transcript_start + transcript_end) / 2
+            transcript_duration = transcript_end - transcript_start
+            
+            # Skip segments with suspicious timestamps (exactly 0 start when others exist)
+            if transcript_start == 0 and transcript_end > 0:
+                # Check if there are other segments with non-zero starts
+                has_non_zero_segments = any(seg.get("start", 0) > 0 for seg in self.transcript_segments)
+                if has_non_zero_segments:
+                    # This might be a spurious 00:00 segment, be more selective
+                    logging.warning(f"[SPEAKER_DIARIZATION] Found suspicious 00:00 segment: '{transcript_seg.get('text', '')[:50]}...'")
             
             # Find the speaker segment that contains this transcript segment
             assigned_speaker = "Unknown"
             best_overlap = 0
+            best_match_quality = 0
             
             for speaker_seg in self.speaker_segments:
                 # Check if transcript segment overlaps with speaker segment
@@ -102,9 +112,18 @@ class InteractiveSpeakerNaming:
                 overlap_end = min(transcript_end, speaker_seg.end_time)
                 overlap_duration = max(0, overlap_end - overlap_start)
                 
-                if overlap_duration > best_overlap:
-                    best_overlap = overlap_duration
-                    assigned_speaker = speaker_seg.speaker_id
+                # Calculate match quality (prioritize segments that are well contained)
+                if overlap_duration > 0:
+                    # How much of the transcript segment is covered by this speaker?
+                    coverage = overlap_duration / max(0.1, transcript_duration)
+                    
+                    # Prefer speakers where the transcript is well-contained
+                    match_quality = overlap_duration * coverage
+                    
+                    if match_quality > best_match_quality:
+                        best_match_quality = match_quality
+                        best_overlap = overlap_duration
+                        assigned_speaker = speaker_seg.speaker_id
             
             merged_segment = transcript_seg.copy()
             merged_segment["speaker"] = assigned_speaker
@@ -129,7 +148,7 @@ class InteractiveSpeakerNaming:
     def get_speaker_sample_quotes(self, merged_segments: List[Dict], max_quote_length: int = 150) -> Dict[str, Tuple[str, str]]:
         """
         Get sample quotes with timestamps for each speaker for identification
-        Prioritizes quotes from early in the meeting (first 5 minutes) for better identification
+        Prioritizes quotes from early in the meeting and validates speaker purity
         
         Args:
             merged_segments: Transcript segments with speaker information
@@ -144,6 +163,14 @@ class InteractiveSpeakerNaming:
         for segment in merged_segments:
             speaker_id = segment.get("speaker", "Unknown")
             text = segment.get("text", "").strip()
+            start_time = segment.get("start", 0)
+            
+            # Skip segments with invalid timestamps (00:00 unless actually at start)
+            if start_time == 0 and text and len([s for s in merged_segments if s.get("start", 0) > 0]) > 0:
+                # Only allow 00:00 if there are no other segments with valid timestamps
+                logging.warning(f"[SPEAKER_DIARIZATION] Skipping segment with suspicious 00:00 timestamp: '{text[:50]}...'")
+                continue
+                
             if text:  # Only require text, include ALL speakers including "Unknown"
                 speaker_segments[speaker_id].append(segment)
         
@@ -166,6 +193,12 @@ class InteractiveSpeakerNaming:
                 for segment in segments_sorted:
                     text = segment.get("text", "").strip()
                     start_time = segment.get("start", 0)
+                    end_time = segment.get("end", start_time)
+                    
+                    # Check for multi-speaker contamination in this segment
+                    if self._is_multi_speaker_segment(segment, speaker_id, merged_segments):
+                        logging.debug(f"[SPEAKER_DIARIZATION] Skipping multi-speaker segment for {speaker_id}: '{text[:50]}...'")
+                        continue
                     
                     # Base scoring criteria
                     score = 0
@@ -186,9 +219,20 @@ class InteractiveSpeakerNaming:
                     if len(text) > 50:
                         score += 1  # Substantial content
                     
+                    # Bonus for segments with good duration (not too short, not too long)
+                    duration = end_time - start_time
+                    if 2 <= duration <= 10:  # 2-10 seconds is usually a good single-speaker segment
+                        score += 2
+                    elif duration > 15:  # Very long segments are more likely multi-speaker
+                        score -= 3
+                    
                     # Penalize very short text
                     if len(text) < 20:
                         score -= 2
+                    
+                    # Bonus for segments that don't start at exactly 00:00 (unless it's the very first)
+                    if start_time > 0.1:  # Allow small floating point errors
+                        score += 1
                     
                     if score > best_score:
                         best_score = score
@@ -216,6 +260,49 @@ class InteractiveSpeakerNaming:
         
         return sample_quotes
     
+    def _is_multi_speaker_segment(self, target_segment: Dict, target_speaker: str, all_segments: List[Dict]) -> bool:
+        """
+        Check if a transcript segment likely contains speech from multiple speakers
+        
+        Args:
+            target_segment: The segment to check
+            target_speaker: The speaker ID we're checking for
+            all_segments: All merged segments to check for overlaps
+            
+        Returns:
+            True if the segment likely contains multiple speakers
+        """
+        target_start = target_segment.get("start", 0)
+        target_end = target_segment.get("end", target_start)
+        target_duration = target_end - target_start
+        
+        # Very long segments (>15 seconds) are suspicious for single speaker
+        if target_duration > 15:
+            return True
+            
+        # Count how many different speakers have segments that overlap with this one
+        overlapping_speakers = set()
+        
+        for segment in all_segments:
+            if segment == target_segment:
+                continue
+                
+            seg_start = segment.get("start", 0)
+            seg_end = segment.get("end", seg_start)
+            seg_speaker = segment.get("speaker", "Unknown")
+            
+            # Check for temporal overlap
+            overlap_start = max(target_start, seg_start)
+            overlap_end = min(target_end, seg_end)
+            overlap_duration = max(0, overlap_end - overlap_start)
+            
+            # If there's significant overlap with a different speaker, it's suspicious
+            if overlap_duration > 0.5 and seg_speaker != target_speaker:  # 0.5 second overlap threshold
+                overlapping_speakers.add(seg_speaker)
+        
+        # If multiple other speakers overlap significantly, this segment is contaminated
+        return len(overlapping_speakers) >= 1
+    
     def prompt_for_speaker_names(self, sample_quotes: Dict[str, Tuple[str, str]], skip_interactive: bool = False) -> Dict[str, str]:
         """
         Prompt user to provide names for speakers
@@ -227,9 +314,22 @@ class InteractiveSpeakerNaming:
         Returns:
             Dictionary mapping speaker IDs to user-provided names
         """
-        # Convert speaker IDs from SPEAKER_00 format to Speaker 1, Speaker 2, etc.
+        # Sort speakers chronologically by their first appearance (earliest quotes first)
+        def get_timestamp_seconds(speaker_id):
+            _, timestamp_str = sample_quotes[speaker_id]
+            # Convert MM:SS to seconds for proper sorting
+            try:
+                minutes, seconds = map(int, timestamp_str.split(':'))
+                return minutes * 60 + seconds
+            except (ValueError, AttributeError):
+                return float('inf')  # Put any malformed timestamps at the end
+        
+        sorted_speakers = sorted(sample_quotes.keys(), key=get_timestamp_seconds)
+        
+        logging.info(f"[SPEAKER_DIARIZATION] Speaker chronological order: {[(sid, sample_quotes[sid][1]) for sid in sorted_speakers]}")
+        
+        # Convert speaker IDs to progressive numbered names based on chronological order
         speaker_mapping = {}
-        sorted_speakers = sorted(sample_quotes.keys())
         
         for idx, speaker_id in enumerate(sorted_speakers):
             speaker_number = idx + 1  # Start from 1 instead of 0
@@ -243,6 +343,7 @@ class InteractiveSpeakerNaming:
         
         print(f"\nFound {len(sample_quotes)} speakers in this meeting.")
         print("Please provide names for each speaker (press Enter to keep default name):")
+        print("Speakers are presented in chronological order (first to speak → last to speak).")
         print("Note: If you enter the same name for multiple speakers, they will be merged.\n")
         
         speaker_names = {}
