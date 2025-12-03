@@ -242,7 +242,7 @@ class WhisperCppBackend:
                 progress_bar = ProgressBar(audio_duration, "Transcribing audio") if audio_duration > 0 else None
                 partial_lines = []
 
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
                 while True:
                     chunk = process.stdout.read(1024)
