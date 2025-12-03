@@ -187,12 +187,12 @@ class SpeakerDiarizationService:
         self.min_segment_duration = min_segment_duration
         self.pipeline = None
 
-        # Device selection
-        if torch.backends.mps.is_available():
-            self.device = "mps"
-            logging.info("Using MPS (Metal) for speaker diarization")
-        else:
-            self.device = "cpu"
+        # Device selection - MPS has poor support for pyannote operations
+        # See: https://github.com/pyannote/pyannote-audio/discussions/1155
+        # Many PyTorch ops used by pyannote aren't implemented for MPS,
+        # causing fallback overhead. CPU is more reliable.
+        self.device = "cpu"
+        logging.info("Using CPU for speaker diarization (MPS not fully supported by pyannote)")
 
     def _load_pipeline(self) -> bool:
         """Load pyannote-audio pipeline."""
@@ -216,8 +216,8 @@ class SpeakerDiarizationService:
                 # Restore original torch.load
                 torch.load = original_load
 
-            if self.device == "mps":
-                self.pipeline.to(torch.device("mps"))
+            # Keep pipeline on CPU (MPS not supported)
+            logging.info("Diarization pipeline loaded on CPU")
             return True
         except Exception as e:
             logging.error(f"Failed to load diarization pipeline: {e}")

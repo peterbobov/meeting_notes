@@ -23,6 +23,7 @@ dependencies = [
     "python-dateutil>=2.8.0",
     "typing-extensions>=4.0.0",
     "ffmpeg-python>=0.2.0",
+    "silero-vad>=5.1",
 ]
 
 [project.optional-dependencies]

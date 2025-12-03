@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pydub import AudioSegment
 from openai import OpenAI
 
+from .audio import SilenceFilter, TimestampRemapper, FilteredAudioResult
+
 
 @dataclass
 class TranscriptionResult:
@@ -144,11 +146,28 @@ class WhisperCppBackend:
         "large-v3": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
     }
 
-    def __init__(self, model_size: str = "medium", models_dir: str = "./whisper_models"):
+    def __init__(
+        self,
+        model_size: str = "medium",
+        models_dir: str = "./whisper_models",
+        filter_silence: bool = True,
+        vad_threshold: float = 0.5,
+        min_silence_duration: float = 0.5
+    ):
         self.model_size = model_size
         self.models_dir = Path(models_dir)
         self.models_dir.mkdir(exist_ok=True)
         self.whisper_binary = self._find_whisper_binary()
+        self.filter_silence = filter_silence
+
+        # Initialize silence filter if enabled
+        self.silence_filter = None
+        if filter_silence:
+            self.silence_filter = SilenceFilter(
+                threshold=vad_threshold,
+                min_silence_duration=min_silence_duration
+            )
+            logging.info("Silence filtering enabled (Silero VAD)")
 
         if not self.whisper_binary:
             raise RuntimeError("whisper-cpp not found. Install with: brew install whisper-cpp")
@@ -210,19 +229,37 @@ class WhisperCppBackend:
     def transcribe(self, file_path: str, language: Optional[str] = None) -> TranscriptionResult:
         """Transcribe audio using whisper.cpp."""
         start_time = time.time()
+        filter_result: Optional[FilteredAudioResult] = None
+        timestamp_remapper: Optional[TimestampRemapper] = None
 
         try:
             if not self.ensure_model_available():
                 raise Exception(f"Model {self.model_size} not available")
 
-            processed_audio = self.preprocess_audio(file_path)
-
-            # Get audio duration
+            # Get original audio duration first
             try:
                 audio = AudioSegment.from_file(file_path)
-                audio_duration = len(audio) / 1000.0
+                original_duration = len(audio) / 1000.0
             except:
-                audio_duration = 0
+                original_duration = 0
+
+            # Apply silence filtering if enabled
+            audio_to_transcribe = file_path
+            if self.filter_silence and self.silence_filter:
+                logging.info("Filtering silence from audio...")
+                filter_result = self.silence_filter.filter_silence(file_path)
+                audio_to_transcribe = filter_result.filtered_path
+                timestamp_remapper = TimestampRemapper(filter_result.speech_segments)
+                logging.info(
+                    f"Silence filtered: {filter_result.original_duration:.1f}s → "
+                    f"{filter_result.filtered_duration:.1f}s"
+                )
+                # Use filtered duration for progress bar
+                audio_duration = filter_result.filtered_duration
+            else:
+                audio_duration = original_duration
+
+            processed_audio = self.preprocess_audio(audio_to_transcribe)
 
             model_path = self.models_dir / self.MODEL_FILES[self.model_size]
 
@@ -261,18 +298,28 @@ class WhisperCppBackend:
                     progress_bar.finish(success=(process.returncode == 0))
 
                 if process.returncode != 0 and partial_lines:
-                    return self._create_result_from_partial(partial_lines, start_time, file_path)
+                    result = self._create_result_from_partial(partial_lines, start_time, file_path)
+                    # Remap timestamps if silence was filtered
+                    if timestamp_remapper:
+                        result = self._remap_result_timestamps(result, timestamp_remapper, original_duration)
+                    return result
 
                 # Parse JSON output
                 json_file = Path(str(output_base) + ".json")
                 if not json_file.exists():
                     if partial_lines:
-                        return self._create_result_from_partial(partial_lines, start_time, file_path)
+                        result = self._create_result_from_partial(partial_lines, start_time, file_path)
+                        if timestamp_remapper:
+                            result = self._remap_result_timestamps(result, timestamp_remapper, original_duration)
+                        return result
                     raise Exception("whisper.cpp JSON output not found")
 
                 whisper_data = self._read_json(json_file)
                 if whisper_data is None and partial_lines:
-                    return self._create_result_from_partial(partial_lines, start_time, file_path)
+                    result = self._create_result_from_partial(partial_lines, start_time, file_path)
+                    if timestamp_remapper:
+                        result = self._remap_result_timestamps(result, timestamp_remapper, original_duration)
+                    return result
 
                 # Extract results
                 text = whisper_data.get("transcription", [])
@@ -288,11 +335,27 @@ class WhisperCppBackend:
                             "text": seg.get("text", "")
                         })
 
-                # Cleanup
+                # Remap timestamps back to original audio time if silence was filtered
+                if timestamp_remapper:
+                    segments = timestamp_remapper.remap_segments(segments)
+                    logging.debug("Timestamps remapped to original audio time")
+
+                # Cleanup temporary files
                 if processed_audio != file_path and Path(processed_audio).exists():
                     Path(processed_audio).unlink()
+                if filter_result and filter_result.filtered_path != file_path:
+                    filtered_path = Path(filter_result.filtered_path)
+                    if filtered_path.exists():
+                        filtered_path.unlink()
 
-                duration = max([s["end"] for s in segments]) if segments else audio_duration
+                # Use original duration for the result
+                duration = original_duration if original_duration > 0 else (
+                    max([s["end"] for s in segments]) if segments else 0
+                )
+
+                optimizations = ["whisper_cpp", "16khz_mono", "8_threads"]
+                if filter_result:
+                    optimizations.append("silence_filtered")
 
                 return TranscriptionResult(
                     text=text.strip(),
@@ -302,7 +365,7 @@ class WhisperCppBackend:
                     processing_time=time.time() - start_time,
                     model_used=self.model_size,
                     confidence_scores=[0.85] * len(segments),
-                    optimizations_applied=["whisper_cpp", "16khz_mono", "8_threads"]
+                    optimizations_applied=optimizations
                 )
 
         except Exception as e:
@@ -312,6 +375,29 @@ class WhisperCppBackend:
                 processing_time=time.time() - start_time, model_used=self.model_size,
                 confidence_scores=[], optimizations_applied=[]
             )
+
+    def _remap_result_timestamps(
+        self,
+        result: TranscriptionResult,
+        remapper: TimestampRemapper,
+        original_duration: float
+    ) -> TranscriptionResult:
+        """Remap timestamps in a TranscriptionResult back to original audio time."""
+        remapped_segments = remapper.remap_segments(result.segments)
+        optimizations = result.optimizations_applied.copy()
+        if "silence_filtered" not in optimizations:
+            optimizations.append("silence_filtered")
+
+        return TranscriptionResult(
+            text=result.text,
+            segments=remapped_segments,
+            language=result.language,
+            duration=original_duration,
+            processing_time=result.processing_time,
+            model_used=result.model_used,
+            confidence_scores=result.confidence_scores,
+            optimizations_applied=optimizations
+        )
 
     def _decode_chunk(self, chunk: bytes) -> str:
         """Decode bytes with encoding fallbacks."""
@@ -391,12 +477,37 @@ class WhisperCppBackend:
 class TranscriptionService:
     """Hybrid transcription service: whisper.cpp primary, OpenAI API fallback."""
 
-    def __init__(self, api_key: str, use_local: bool = True, model: str = "medium"):
+    def __init__(
+        self,
+        api_key: str,
+        use_local: bool = True,
+        model: str = "medium",
+        filter_silence: bool = True,
+        vad_threshold: float = 0.5,
+        min_silence_duration: float = 0.5
+    ):
         self.api_key = api_key
         self.use_local = use_local
+        self.filter_silence = filter_silence
+        self.vad_threshold = vad_threshold
+        self.min_silence_duration = min_silence_duration
+
+        # Initialize silence filter for API mode (local backend handles its own)
+        self.silence_filter = None
+        if filter_silence and not use_local:
+            self.silence_filter = SilenceFilter(
+                threshold=vad_threshold,
+                min_silence_duration=min_silence_duration
+            )
+            logging.info("Silence filtering enabled for API mode (Silero VAD)")
 
         if use_local:
-            self.backend = WhisperCppBackend(model_size=model)
+            self.backend = WhisperCppBackend(
+                model_size=model,
+                filter_silence=filter_silence,
+                vad_threshold=vad_threshold,
+                min_silence_duration=min_silence_duration
+            )
             logging.info(f"Using whisper.cpp with model '{model}'")
         else:
             self.client = OpenAI(api_key=api_key)
@@ -415,11 +526,34 @@ class TranscriptionService:
 
     def _transcribe_api(self, file_path: str, language: Optional[str] = None) -> Dict:
         """Transcribe using OpenAI Whisper API."""
+        filter_result: Optional[FilteredAudioResult] = None
+        timestamp_remapper: Optional[TimestampRemapper] = None
+        audio_to_transcribe = file_path
+
         try:
             if not hasattr(self, 'client'):
                 self.client = OpenAI(api_key=self.api_key)
 
-            with open(file_path, "rb") as f:
+            # Get original duration
+            try:
+                from pydub import AudioSegment as PydubSegment
+                audio = PydubSegment.from_file(file_path)
+                original_duration = len(audio) / 1000.0
+            except:
+                original_duration = 0
+
+            # Apply silence filtering if enabled
+            if self.filter_silence and self.silence_filter:
+                logging.info("Filtering silence from audio for API...")
+                filter_result = self.silence_filter.filter_silence(file_path)
+                audio_to_transcribe = filter_result.filtered_path
+                timestamp_remapper = TimestampRemapper(filter_result.speech_segments)
+                logging.info(
+                    f"Silence filtered: {filter_result.original_duration:.1f}s → "
+                    f"{filter_result.filtered_duration:.1f}s"
+                )
+
+            with open(audio_to_transcribe, "rb") as f:
                 params = {
                     "model": "whisper-1",
                     "file": f,
@@ -431,16 +565,52 @@ class TranscriptionService:
 
                 transcript = self.client.audio.transcriptions.create(**params)
 
+            # Extract segments
+            segments = []
+            if hasattr(transcript, 'segments') and transcript.segments:
+                for seg in transcript.segments:
+                    segments.append({
+                        'start': getattr(seg, 'start', 0),
+                        'end': getattr(seg, 'end', 0),
+                        'text': getattr(seg, 'text', '')
+                    })
+
+            # Remap timestamps if silence was filtered
+            if timestamp_remapper:
+                segments = timestamp_remapper.remap_segments(segments)
+                logging.debug("API timestamps remapped to original audio time")
+
+            # Cleanup filtered audio
+            if filter_result and filter_result.filtered_path != file_path:
+                filtered_path = Path(filter_result.filtered_path)
+                if filtered_path.exists():
+                    filtered_path.unlink()
+
+            optimizations = ['openai_api']
+            if filter_result:
+                optimizations.append('silence_filtered')
+
             return {
                 'text': transcript.text,
-                'segments': transcript.segments if hasattr(transcript, 'segments') else [],
-                'duration': transcript.duration if hasattr(transcript, 'duration') else 0,
+                'segments': segments,
+                'duration': original_duration if original_duration > 0 else (
+                    transcript.duration if hasattr(transcript, 'duration') else 0
+                ),
                 'language': transcript.language if hasattr(transcript, 'language') else 'unknown',
-                'processing_info': {'method': 'openai_api', 'model': 'whisper-1'}
+                'processing_info': {
+                    'method': 'openai_api',
+                    'model': 'whisper-1',
+                    'optimizations': optimizations
+                }
             }
 
         except Exception as e:
             logging.error(f"API transcription failed: {e}")
+            # Cleanup on error
+            if filter_result and filter_result.filtered_path != file_path:
+                filtered_path = Path(filter_result.filtered_path)
+                if filtered_path.exists():
+                    filtered_path.unlink()
             return {'text': '', 'segments': [], 'duration': 0, 'language': 'unknown', 'error': str(e)}
 
     def _result_to_dict(self, result: TranscriptionResult, method: str) -> Dict:

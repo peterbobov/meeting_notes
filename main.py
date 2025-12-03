@@ -44,6 +44,14 @@ Examples:
     parser.add_argument('--model', help='Whisper model (tiny, base, small, medium, large, large-v2, large-v3)')
     parser.add_argument('--summary-language', help='Language for AI output')
 
+    # Silence filtering options (anti-hallucination)
+    parser.add_argument('--no-filter-silence', action='store_true',
+                        help='Disable silence filtering (not recommended, may cause hallucinations)')
+    parser.add_argument('--vad-threshold', type=float, default=0.5,
+                        help='VAD confidence threshold 0-1 (default: 0.5, higher=stricter)')
+    parser.add_argument('--min-silence', type=float, default=0.5,
+                        help='Minimum silence duration to filter in seconds (default: 0.5)')
+
     # Speaker options
     parser.add_argument('--speakers', action='store_true', help='Enable speaker identification')
     parser.add_argument('--no-interactive', action='store_true', help='Skip interactive speaker naming')
@@ -95,7 +103,10 @@ Examples:
             skip_interactive_naming=args.no_interactive,
             template_name=args.template,
             ai_provider=args.ai_provider,
-            transcribe_only=args.transcribe_only
+            transcribe_only=args.transcribe_only,
+            filter_silence=not args.no_filter_silence,
+            vad_threshold=args.vad_threshold,
+            min_silence_duration=args.min_silence
         )
 
         if args.file:

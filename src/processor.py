@@ -36,7 +36,10 @@ class PlaudProcessor:
         skip_interactive_naming: bool = False,
         template_name: Optional[str] = None,
         ai_provider: Optional[str] = None,
-        transcribe_only: bool = False
+        transcribe_only: bool = False,
+        filter_silence: bool = True,
+        vad_threshold: float = 0.5,
+        min_silence_duration: float = 0.5
     ):
         self.config = self._load_config(config_path)
         self.context = context
@@ -48,6 +51,9 @@ class PlaudProcessor:
         self.skip_interactive_naming = skip_interactive_naming
         self.template_name = template_name
         self.transcribe_only = transcribe_only
+        self.filter_silence = filter_silence
+        self.vad_threshold = vad_threshold
+        self.min_silence_duration = min_silence_duration
 
         self._setup_logging()
 
@@ -64,7 +70,12 @@ class PlaudProcessor:
         if transcribe_only:
             # For transcribe-only mode, we just need transcription service
             openai_key = os.getenv('OPENAI_API_KEY', 'dummy')
-            self.transcription = TranscriptionService(openai_key, use_local, model)
+            self.transcription = TranscriptionService(
+                openai_key, use_local, model,
+                filter_silence=filter_silence,
+                vad_threshold=vad_threshold,
+                min_silence_duration=min_silence_duration
+            )
             logging.info("Transcribe-only mode: AI processing disabled")
         else:
             provider = (ai_provider or os.getenv('AI_PROVIDER', 'openai')).lower()
@@ -75,14 +86,24 @@ class PlaudProcessor:
                 if not yandex_key or not yandex_folder:
                     raise ValueError("YandexGPT requires YANDEX_API_KEY and YANDEX_FOLDER_ID")
                 openai_key = os.getenv('OPENAI_API_KEY', 'dummy')
-                self.transcription = TranscriptionService(openai_key, use_local, model)
+                self.transcription = TranscriptionService(
+                    openai_key, use_local, model,
+                    filter_silence=filter_silence,
+                    vad_threshold=vad_threshold,
+                    min_silence_duration=min_silence_duration
+                )
                 self.ai = AIProcessor(yandex_key, 'yandex', yandex_folder)
                 logging.info(f"Using YandexGPT for AI processing")
             else:
                 api_key = os.getenv('OPENAI_API_KEY')
                 if not api_key:
                     raise ValueError("OPENAI_API_KEY required")
-                self.transcription = TranscriptionService(api_key, use_local, model)
+                self.transcription = TranscriptionService(
+                    api_key, use_local, model,
+                    filter_silence=filter_silence,
+                    vad_threshold=vad_threshold,
+                    min_silence_duration=min_silence_duration
+                )
                 self.ai = AIProcessor(api_key)
                 logging.info("Using OpenAI GPT-4o for AI processing")
 
