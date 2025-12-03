@@ -257,7 +257,11 @@ class SpeakerDiarizationService:
             segments = []
             stats = defaultdict(lambda: {"total_time": 0.0, "segments": 0})
 
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
+            # pyannote 4.x API: use speaker_diarization attribute
+            # See: https://github.com/pyannote/pyannote-audio
+            diarization_data = getattr(diarization, 'speaker_diarization', diarization)
+
+            for turn, speaker in diarization_data:
                 if turn.duration >= self.min_segment_duration:
                     seg = SpeakerSegment(
                         start_time=turn.start,
