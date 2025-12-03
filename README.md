@@ -35,12 +35,11 @@ Transform any audio recording into structured, searchable Obsidian notes with AI
 git clone https://github.com/peterbobov/meeting_notes.git
 cd meeting_notes
 
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+# Install uv (if not already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies with uv (automatically creates virtual environment)
+uv sync
 
 # Install FFmpeg (required for audio processing)
 # macOS:
@@ -48,9 +47,6 @@ brew install ffmpeg
 # Ubuntu/Debian:
 sudo apt install ffmpeg
 # Windows: Download from https://ffmpeg.org/
-
-# Optional: Install speaker diarization dependencies
-pip install pyannote-audio>=3.1.0
 ```
 
 ### Step 2: Configuration
@@ -72,7 +68,7 @@ HUGGINGFACE_TOKEN=your_huggingface_token_here             # Optional: For speake
 #### Option A: Automatic Processing (Recommended)
 ```bash
 # Start continuous monitoring
-python main.py --monitor
+uv run python main.py --monitor
 
 # In another terminal/process:
 # 1. Record audio (Plaud Pin, iPhone, any recorder)
@@ -83,16 +79,16 @@ python main.py --monitor
 #### Option B: Manual Processing
 ```bash
 # Process a specific file
-python main.py --file path/to/your/recording.mp3
+uv run python main.py --file path/to/your/recording.mp3
 
 # Process with custom config
-python main.py --file recording.mp3 --config custom_config.ini
+uv run python main.py --file recording.mp3 --config custom_config.ini
 
 # Process with speaker identification
-python main.py --file meeting.mp3 --speakers
+uv run python main.py --file meeting.mp3 --speakers
 
 # Process with speaker identification (skip interactive naming)
-python main.py --file meeting.mp3 --speakers --no-interactive
+uv run python main.py --file meeting.mp3 --speakers --no-interactive
 ```
 
 ### Step 4: Obsidian Integration
@@ -208,17 +204,17 @@ plaud_processor/
 Enable speaker identification for multi-person meetings:
 ```bash
 # Interactive speaker naming
-python main.py --file meeting.mp3 --speakers
+uv run python main.py --file meeting.mp3 --speakers
 
 # Skip interactive naming (use default Speaker A, B, C)
-python main.py --file meeting.mp3 --speakers --no-interactive
+uv run python main.py --file meeting.mp3 --speakers --no-interactive
 
 # Combined with other features
-python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
+uv run python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
 ```
 
 **Requirements:**
-- Install `pyannote-audio>=3.1.0`
+- `pyannote-audio` is included in dependencies (installed via `uv sync`)
 - Set `HUGGINGFACE_TOKEN` in .env file
 - Accept pyannote model license at https://huggingface.co/pyannote/speaker-diarization-3.1
 
@@ -232,7 +228,7 @@ Edit `config.ini` to customize AI processing:
 ```bash
 # Process all MP3 files in a directory
 for file in /your_path_to_recordings_here/*.mp3; do
-    python main.py --file "$file"
+    uv run python main.py --file "$file"
 done
 ```
 
@@ -254,12 +250,9 @@ done
 
 1. **Verify Setup**
    ```bash
-   # Activate virtual environment
-   source .venv/bin/activate
-   
-   # Check dependencies
-   pip list | grep -E "(openai|librosa|pydub|python-dotenv)"
-   
+   # Check dependencies are installed
+   uv pip list | grep -E "(openai|librosa|pydub|python-dotenv)"
+
    # Verify config files exist
    ls -la .env config.ini
    ```
@@ -268,12 +261,12 @@ done
    ```bash
    # Create test folder structure
    mkdir -p input_audio test_outputs
-   
+
    # Record a short test audio (or use any MP3/WAV file)
    # Place in input_audio/ folder
-   
+
    # Test single file processing
-   python main.py --file input_audio/your_test_file.mp3
+   uv run python main.py --file input_audio/your_test_file.mp3
    ```
 
 3. **Verify Output Structure**
@@ -292,11 +285,11 @@ done
 4. **Test Continuous Monitoring**
    ```bash
    # Start monitoring (in one terminal)
-   python main.py --monitor
-   
+   uv run python main.py --monitor
+
    # Add new file (in another terminal)
    cp test_file.mp3 input_audio/new_recording.mp3
-   
+
    # Should auto-process within seconds
    ```
 
@@ -322,20 +315,20 @@ done
 
 ```bash
 # Test different audio formats
-python main.py --file test.mp3
-python main.py --file test.wav  
-python main.py --file test.m4a
+uv run python main.py --file test.mp3
+uv run python main.py --file test.wav
+uv run python main.py --file test.m4a
 
 # Test speaker diarization
-python main.py --file meeting.mp3 --speakers
-python main.py --file meeting.mp3 --speakers --no-interactive
+uv run python main.py --file meeting.mp3 --speakers
+uv run python main.py --file meeting.mp3 --speakers --no-interactive
 
 # Test error handling
-python main.py --file nonexistent.mp3  # Should handle gracefully
-python main.py --file empty.mp3        # Should detect and skip
+uv run python main.py --file nonexistent.mp3  # Should handle gracefully
+uv run python main.py --file empty.mp3        # Should detect and skip
 
 # Test configuration
-python main.py --config test_config.ini --file test.mp3
+uv run python main.py --config test_config.ini --file test.mp3
 ```
 
 ## 🌟 Why Choose This Over Plaud's Service?
