@@ -197,10 +197,25 @@ class SpeakerDiarizationService:
     def _load_pipeline(self) -> bool:
         """Load pyannote-audio pipeline."""
         try:
-            self.pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=os.getenv("HUGGINGFACE_TOKEN")
+            hf_token = os.getenv("HUGGINGFACE_TOKEN")
+
+            # PyTorch 2.6+ changed weights_only default to True, breaking pyannote
+            # Workaround: temporarily set weights_only=False for model loading
+            # See: https://github.com/pyannote/pyannote-audio/issues/1908
+            original_load = torch.load
+            torch.load = lambda *args, **kwargs: original_load(
+                *args, **{**kwargs, 'weights_only': False}
             )
+
+            try:
+                self.pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    token=hf_token
+                )
+            finally:
+                # Restore original torch.load
+                torch.load = original_load
+
             if self.device == "mps":
                 self.pipeline.to(torch.device("mps"))
             return True
