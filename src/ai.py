@@ -7,7 +7,7 @@ from openai import OpenAI
 
 
 class AIProcessor:
-    """AI processing using OpenAI GPT-4o or YandexGPT."""
+    """AI processing using OpenAI GPT-5-mini or YandexGPT."""
 
     def __init__(self, api_key: str, provider: str = "openai", yandex_folder_id: Optional[str] = None):
         self.provider = provider
@@ -20,7 +20,7 @@ class AIProcessor:
             self.model_name = f"gpt://{yandex_folder_id}/yandexgpt/latest"
         else:
             self.client = OpenAI(api_key=api_key)
-            self.model_name = "gpt-4o"
+            self.model_name = "gpt-5-mini"
 
     def process_with_template(self, transcript: str, file_config: Dict,
                               context: Optional[str] = None,

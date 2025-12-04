@@ -27,6 +27,7 @@ class TranscriptionResult:
     model_used: str
     confidence_scores: List[float]
     optimizations_applied: List[str]
+    filter_result: Optional[FilteredAudioResult] = None  # For reuse by diarization
 
 
 class ProgressBar:
@@ -343,10 +344,9 @@ class WhisperCppBackend:
                 # Cleanup temporary files
                 if processed_audio != file_path and Path(processed_audio).exists():
                     Path(processed_audio).unlink()
-                if filter_result and filter_result.filtered_path != file_path:
-                    filtered_path = Path(filter_result.filtered_path)
-                    if filtered_path.exists():
-                        filtered_path.unlink()
+                # Note: We DON'T delete filter_result.filtered_path here
+                # because it may be reused by diarization. The processor
+                # is responsible for cleanup after diarization is done.
 
                 # Use original duration for the result
                 duration = original_duration if original_duration > 0 else (
@@ -365,7 +365,8 @@ class WhisperCppBackend:
                     processing_time=time.time() - start_time,
                     model_used=self.model_size,
                     confidence_scores=[0.85] * len(segments),
-                    optimizations_applied=optimizations
+                    optimizations_applied=optimizations,
+                    filter_result=filter_result  # Pass through for diarization reuse
                 )
 
         except Exception as e:
@@ -518,7 +519,7 @@ class TranscriptionService:
         if self.use_local:
             result = self.backend.transcribe(file_path, language)
             if result.text:
-                return self._result_to_dict(result, "local_whisper")
+                return self._result_to_dict(result, "local_whisper", result.filter_result)
             # Fallback to API
             logging.info("Local transcription failed, falling back to API...")
 
@@ -613,7 +614,7 @@ class TranscriptionService:
                     filtered_path.unlink()
             return {'text': '', 'segments': [], 'duration': 0, 'language': 'unknown', 'error': str(e)}
 
-    def _result_to_dict(self, result: TranscriptionResult, method: str) -> Dict:
+    def _result_to_dict(self, result: TranscriptionResult, method: str, filter_result: Optional[FilteredAudioResult] = None) -> Dict:
         """Convert TranscriptionResult to dict."""
         return {
             'text': result.text,
@@ -625,7 +626,8 @@ class TranscriptionService:
                 'model': result.model_used,
                 'processing_time': result.processing_time,
                 'optimizations': result.optimizations_applied
-            }
+            },
+            'filter_result': filter_result  # Pass through for reuse by diarization
         }
 
     def format_transcript(self, segments: List) -> str:

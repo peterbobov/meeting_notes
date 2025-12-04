@@ -128,7 +128,11 @@ class PlaudProcessor:
         self.speaker_service = None
         if enable_speakers:
             try:
-                self.speaker_service = SpeakerDiarizationService()
+                self.speaker_service = SpeakerDiarizationService(
+                    filter_silence=filter_silence,
+                    vad_threshold=vad_threshold,
+                    min_silence_duration=min_silence_duration
+                )
                 logging.info("Speaker diarization enabled")
             except ImportError as e:
                 logging.warning(f"Speaker diarization not available: {e}")
@@ -215,10 +219,28 @@ class PlaudProcessor:
 
             self._log("TRANSCRIPTION", "Complete")
 
+            # Cleanup filtered audio if not using speaker diarization
+            filter_result = transcript.get('filter_result')
+            if filter_result and not (self.enable_speakers and self.speaker_service):
+                if filter_result.filtered_path != file_path:
+                    filtered_path = Path(filter_result.filtered_path)
+                    if filtered_path.exists():
+                        filtered_path.unlink()
+                        logging.debug("Cleaned up filtered audio file (no diarization)")
+
             # Speaker diarization
             if self.enable_speakers and self.speaker_service:
                 self._log("SPEAKER_DIARIZATION", "Identifying speakers...")
-                result = self.speaker_service.perform_diarization(file_path)
+                # Pass filter_result from transcription to avoid running VAD twice
+                precomputed_filter = transcript.get('filter_result')
+                result = self.speaker_service.perform_diarization(file_path, precomputed_filter)
+
+                # Cleanup the filtered audio file after diarization is done
+                if precomputed_filter and precomputed_filter.filtered_path != file_path:
+                    filtered_path = Path(precomputed_filter.filtered_path)
+                    if filtered_path.exists():
+                        filtered_path.unlink()
+                        logging.debug("Cleaned up filtered audio file")
 
                 if result.speakers:
                     self._log("SPEAKER_DIARIZATION", f"Found {len(result.speakers)} speakers")

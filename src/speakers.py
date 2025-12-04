@@ -13,8 +13,11 @@ from collections import defaultdict
 import torch
 from pydub import AudioSegment
 
+from .audio import SilenceFilter, TimestampRemapper, FilteredAudioResult, SpeechSegment
+
 try:
     from pyannote.audio import Pipeline
+    from pyannote.audio.pipelines.utils.hook import ProgressHook
     PYANNOTE_AVAILABLE = True
 except ImportError:
     PYANNOTE_AVAILABLE = False
@@ -176,28 +179,61 @@ class SpeakerNaming:
         return result
 
 
+
+
 class SpeakerDiarizationService:
     """Speaker diarization using pyannote-audio, optimized for Apple Silicon."""
 
-    def __init__(self, confidence_threshold: float = 0.7, min_segment_duration: float = 1.0):
+    def __init__(
+        self,
+        confidence_threshold: float = 0.7,
+        min_segment_duration: float = 1.0,
+        filter_silence: bool = True,
+        vad_threshold: float = 0.5,
+        min_silence_duration: float = 0.5
+    ):
         if not PYANNOTE_AVAILABLE:
             raise ImportError("pyannote-audio required. Install with: pip install pyannote-audio")
 
         self.confidence_threshold = confidence_threshold
         self.min_segment_duration = min_segment_duration
         self.pipeline = None
+        self.filter_silence = filter_silence
 
-        # Device selection - MPS has poor support for pyannote operations
-        # See: https://github.com/pyannote/pyannote-audio/discussions/1155
-        # Many PyTorch ops used by pyannote aren't implemented for MPS,
-        # causing fallback overhead. CPU is more reliable.
-        self.device = "cpu"
-        logging.info("Using CPU for speaker diarization (MPS not fully supported by pyannote)")
+        # Initialize silence filter if enabled
+        self.silence_filter = None
+        if filter_silence:
+            self.silence_filter = SilenceFilter(
+                threshold=vad_threshold,
+                min_silence_duration=min_silence_duration
+            )
+            logging.info("Silence filtering enabled for diarization (Silero VAD)")
+
+        # Device selection - try MPS first, fall back to CPU
+        # pyannote 3.1+ with pure PyTorch has better MPS support
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+            logging.info("Using MPS (Apple Silicon GPU) for speaker diarization")
+        else:
+            self.device = "cpu"
+            logging.info("Using CPU for speaker diarization")
 
     def _load_pipeline(self) -> bool:
         """Load pyannote-audio pipeline."""
         try:
             hf_token = os.getenv("HUGGINGFACE_TOKEN")
+
+            # CRITICAL: Prevent threading deadlock and CPU thrashing
+            # See: https://github.com/pyannote/pyannote-audio/issues/442
+            # pyannote hangs at ~95% due to PyThread_acquire_lock deadlock
+            # Limiting threads prevents deadlock and actually improves performance
+            os.environ["OMP_NUM_THREADS"] = "1"
+            os.environ["MKL_NUM_THREADS"] = "1"
+            os.environ["NUMEXPR_NUM_THREADS"] = "1"
+            os.environ["OPENBLAS_NUM_THREADS"] = "1"
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+            logging.info("Set single-threaded mode to prevent deadlock")
 
             # PyTorch 2.6+ changed weights_only default to True, breaking pyannote
             # Workaround: temporarily set weights_only=False for model loading
@@ -216,8 +252,12 @@ class SpeakerDiarizationService:
                 # Restore original torch.load
                 torch.load = original_load
 
-            # Keep pipeline on CPU (MPS not supported)
-            logging.info("Diarization pipeline loaded on CPU")
+            # Move pipeline to device (MPS for Apple Silicon, CPU otherwise)
+            if self.device == "mps":
+                self.pipeline = self.pipeline.to(torch.device("mps"))
+                logging.info("Diarization pipeline loaded on MPS (Apple Silicon GPU)")
+            else:
+                logging.info("Diarization pipeline loaded on CPU (single-threaded)")
             return True
         except Exception as e:
             logging.error(f"Failed to load diarization pipeline: {e}")
@@ -239,20 +279,70 @@ class SpeakerDiarizationService:
             logging.warning(f"Audio optimization failed: {e}")
             return audio_path
 
-    def perform_diarization(self, audio_path: str) -> DiarizationResult:
-        """Perform speaker diarization."""
+    def perform_diarization(
+        self,
+        audio_path: str,
+        precomputed_filter: Optional[FilteredAudioResult] = None
+    ) -> DiarizationResult:
+        """Perform speaker diarization.
+
+        Args:
+            audio_path: Path to the original audio file
+            precomputed_filter: Optional pre-computed VAD result from transcription
+                              to avoid running VAD twice
+        """
         start_time = time.time()
+        filter_result: Optional[FilteredAudioResult] = None
+        timestamp_remapper: Optional[TimestampRemapper] = None
+        used_precomputed = False
 
         try:
             if self.pipeline is None and not self._load_pipeline():
                 raise Exception("Pipeline not loaded")
 
-            optimized = self._optimize_audio(audio_path)
+            # Get original audio duration
             audio = AudioSegment.from_file(audio_path)
-            total_duration = len(audio) / 1000.0
+            original_duration = len(audio) / 1000.0
 
-            logging.info(f"[SPEAKER_DIARIZATION] Processing {total_duration:.1f}s of audio...")
-            diarization = self.pipeline(optimized)
+            # Use precomputed VAD result if available, otherwise run VAD
+            audio_to_process = audio_path
+            if precomputed_filter and Path(precomputed_filter.filtered_path).exists():
+                # Reuse VAD result from transcription
+                filter_result = precomputed_filter
+                audio_to_process = filter_result.filtered_path
+                timestamp_remapper = TimestampRemapper(filter_result.speech_segments)
+                used_precomputed = True
+                logging.info(
+                    f"Reusing VAD from transcription: {filter_result.original_duration:.1f}s → "
+                    f"{filter_result.filtered_duration:.1f}s (skipped duplicate VAD)"
+                )
+                processing_duration = filter_result.filtered_duration
+            elif self.filter_silence and self.silence_filter:
+                logging.info("Filtering silence from audio before diarization...")
+                filter_result = self.silence_filter.filter_silence(audio_path)
+                audio_to_process = filter_result.filtered_path
+                timestamp_remapper = TimestampRemapper(filter_result.speech_segments)
+                logging.info(
+                    f"Silence filtered: {filter_result.original_duration:.1f}s → "
+                    f"{filter_result.filtered_duration:.1f}s "
+                    f"({filter_result.original_duration - filter_result.filtered_duration:.1f}s removed)"
+                )
+                processing_duration = filter_result.filtered_duration
+            else:
+                processing_duration = original_duration
+
+            optimized = self._optimize_audio(audio_to_process)
+            logging.info(f"[DIARIZATION] Audio optimized: {optimized}")
+
+            logging.info(f"[DIARIZATION] Starting pyannote pipeline on {processing_duration:.1f}s of audio...")
+
+            # Run diarization with pyannote's built-in progress bars
+            diarization_start = time.time()
+            with ProgressHook() as hook:
+                diarization = self.pipeline(optimized, hook=hook)
+
+            diarization_time = time.time() - diarization_start
+            logging.info(f"[DIARIZATION] Pipeline completed in {diarization_time:.1f}s")
 
             segments = []
             stats = defaultdict(lambda: {"total_time": 0.0, "segments": 0})
@@ -263,9 +353,17 @@ class SpeakerDiarizationService:
 
             for turn, speaker in diarization_data:
                 if turn.duration >= self.min_segment_duration:
+                    # Remap timestamps if silence was filtered
+                    if timestamp_remapper:
+                        orig_start = timestamp_remapper.remap_timestamp(turn.start)
+                        orig_end = timestamp_remapper.remap_timestamp(turn.end)
+                    else:
+                        orig_start = turn.start
+                        orig_end = turn.end
+
                     seg = SpeakerSegment(
-                        start_time=turn.start,
-                        end_time=turn.end,
+                        start_time=orig_start,
+                        end_time=orig_end,
                         speaker_id=speaker,
                         confidence=0.8
                     )
@@ -276,12 +374,16 @@ class SpeakerDiarizationService:
             speakers = list(set(s.speaker_id for s in segments))
             for sid in speakers:
                 s = stats[sid]
-                s["percentage"] = (s["total_time"] / total_duration) * 100
+                s["percentage"] = (s["total_time"] / original_duration) * 100
                 s["avg_segment_duration"] = s["total_time"] / s["segments"] if s["segments"] else 0
 
             # Cleanup
-            if optimized != audio_path and Path(optimized).exists():
+            if optimized != audio_to_process and Path(optimized).exists():
                 Path(optimized).unlink()
+            # Cleanup filtered audio temp file (only if we created it, not if precomputed)
+            if filter_result and not used_precomputed and filter_result.filtered_path != audio_path:
+                if Path(filter_result.filtered_path).exists():
+                    Path(filter_result.filtered_path).unlink()
             gc.collect()
             if self.device == "mps":
                 torch.mps.empty_cache()
@@ -292,7 +394,7 @@ class SpeakerDiarizationService:
                 speakers=speakers,
                 segments=segments,
                 speaker_stats=dict(stats),
-                total_duration=total_duration,
+                total_duration=original_duration,
                 processing_time=time.time() - start_time
             )
 
