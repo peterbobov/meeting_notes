@@ -29,6 +29,7 @@ Examples:
 
     # Core options
     parser.add_argument('--file', help='Process single audio file')
+    parser.add_argument('--from-transcript', help='Resume from saved transcript JSON (skips transcription)')
     parser.add_argument('--monitor', action='store_true', help='Monitor folder for new files')
     parser.add_argument('--config', default='config.ini', help='Config file path')
 
@@ -53,7 +54,7 @@ Examples:
                         help='Minimum silence duration to filter in seconds (default: 0.5)')
 
     # Speaker options
-    parser.add_argument('--speakers', action='store_true', help='Enable speaker identification')
+    parser.add_argument('--no-speakers', action='store_true', help='Disable speaker identification (e.g., for self-recordings)')
     parser.add_argument('--no-interactive', action='store_true', help='Skip interactive speaker naming')
 
     # AI provider
@@ -83,7 +84,7 @@ Examples:
         return 0
 
     # Validate arguments
-    if not args.file and not args.monitor:
+    if not args.file and not args.monitor and not args.from_transcript:
         parser.print_help()
         return 1
 
@@ -99,7 +100,7 @@ Examples:
             transcription_language=args.language,
             whisper_model=args.model,
             verbose=args.verbose,
-            enable_speakers=args.speakers,
+            enable_speakers=not args.no_speakers,
             skip_interactive_naming=args.no_interactive,
             template_name=args.template,
             ai_provider=args.ai_provider,
@@ -109,7 +110,21 @@ Examples:
             min_silence_duration=args.min_silence
         )
 
-        if args.file:
+        if args.from_transcript:
+            if not Path(args.from_transcript).exists():
+                print(f"Transcript file not found: {args.from_transcript}")
+                return 1
+
+            print(f"Resuming from transcript: {args.from_transcript}")
+            success = processor.process_from_transcript(args.from_transcript)
+            if success:
+                print("Done!")
+                return 0
+            else:
+                print("Processing failed. Check logs.")
+                return 1
+
+        elif args.file:
             if not Path(args.file).exists():
                 print(f"File not found: {args.file}")
                 return 1

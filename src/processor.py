@@ -2,6 +2,7 @@
 
 import os
 import re
+import json
 import datetime
 import logging
 import time
@@ -219,6 +220,10 @@ class PlaudProcessor:
 
             self._log("TRANSCRIPTION", "Complete")
 
+            # Save transcript for potential resume
+            cache_path = self._save_transcript(transcript, file_path, duration)
+            self._log("TRANSCRIPTION", f"Cached for resume: {cache_path}")
+
             # Cleanup filtered audio if not using speaker diarization
             filter_result = transcript.get('filter_result')
             if filter_result and not (self.enable_speakers and self.speaker_service):
@@ -422,3 +427,178 @@ class PlaudProcessor:
     def process_single_file(self, file_path: str) -> bool:
         """Process a single file."""
         return self.process_file(file_path)
+
+    def _save_transcript(self, transcript: Dict, file_path: str, duration: float):
+        """Save transcript to cache for potential resume."""
+        cache_dir = Path(self.config['PATHS'].get('logs_folder', './logs')) / 'transcripts'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cache_data = {
+            'transcript': transcript,
+            'original_file': file_path,
+            'duration': duration,
+            'saved_at': datetime.datetime.now().isoformat()
+        }
+
+        # Use original filename as cache name
+        cache_name = Path(file_path).stem + '_transcript.json'
+        cache_path = cache_dir / cache_name
+
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            # Remove non-serializable filter_result before saving
+            save_data = cache_data.copy()
+            if 'filter_result' in save_data['transcript']:
+                save_data['transcript'] = save_data['transcript'].copy()
+                del save_data['transcript']['filter_result']
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+
+        logging.info(f"Transcript cached: {cache_path}")
+        return cache_path
+
+    def process_from_transcript(self, transcript_path: str) -> bool:
+        """Process from a saved transcript file, skipping transcription."""
+        try:
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+
+            transcript = cache_data['transcript']
+            file_path = cache_data['original_file']
+            duration = cache_data['duration']
+
+            self._log("PIPELINE", f"Resuming from cached transcript")
+            self._log("PIPELINE", f"Original file: {Path(file_path).name}")
+
+            return self._process_transcript(transcript, file_path, duration)
+
+        except Exception as e:
+            logging.error(f"Error loading transcript: {e}")
+            return False
+
+    def _process_transcript(self, transcript: Dict, file_path: str, duration: float) -> bool:
+        """Process a transcript through AI and file generation (shared logic)."""
+        try:
+            # Format transcript
+            if self.enable_speakers and transcript.get('speaker_names'):
+                lines = []
+                for seg in transcript['segments']:
+                    t = self._format_time(seg.get("start", 0))
+                    speaker = seg.get("speaker", "Unknown")
+                    text = seg.get("text", "").strip()
+                    if text:
+                        lines.append(f"[{t}] {speaker}: {text}")
+                formatted = '\n'.join(lines)
+            else:
+                formatted = self.transcription.format_transcript(transcript['segments'])
+
+            date_str = datetime.date.today().strftime('%Y-%m-%d')
+
+            # Transcribe-only mode
+            if self.transcribe_only:
+                self._log("FILE_GENERATION", "Creating transcript output...")
+                title = Path(file_path).stem.replace('_', ' ').replace('-', ' ').title()
+                folder = self.obsidian.create_folder(title, date_str)
+                transcript_data = {
+                    'title': title,
+                    'date': date_str,
+                    'duration_formatted': f"{int(duration//60):02d}:{int(duration%60):02d}",
+                    'formatted_transcript': formatted
+                }
+                files = {'transcript': self.obsidian.generate_transcript(transcript_data)}
+                self.obsidian.write_files(folder, files)
+                self._log("PIPELINE", f"Complete! Transcript: {folder}")
+                return True
+
+            # Full AI Processing
+            self._log("AI_PROCESSING", "Generating content...")
+            prompts = self.config['PROMPTS']
+
+            self._log("AI_PROCESSING", "Generating title...")
+            title = self.ai.generate_title(transcript['text'], prompts['title_generation_prompt'])
+
+            detected_lang = transcript.get('language', 'unknown')
+            lang = self.transcription_language or self.config.get('SETTINGS', 'transcription_language', fallback=None)
+            if detected_lang == 'unknown' and lang:
+                detected_lang = lang
+            target_lang = get_language_name(self.summary_language or detected_lang)
+
+            processed = {}
+            if self.template:
+                self._log("AI_PROCESSING", f"Using template: {self.template['name']}")
+                for key, config in self.template['files'].items():
+                    if config.get('enabled'):
+                        self._log("AI_PROCESSING", f"Generating {key}...")
+                        processed[key] = self.ai.process_with_template(
+                            transcript['text'], config, self.context, target_lang
+                        )
+            else:
+                self._log("AI_PROCESSING", f"Generating summary in {target_lang}...")
+                processed['summary'] = self.ai.generate_summary(
+                    transcript['text'], prompts['summary_prompt'], self.context, target_lang
+                )
+                if self.generate_action_items:
+                    self._log("AI_PROCESSING", "Extracting action items...")
+                    processed['action_items'] = self.ai.extract_action_items(
+                        transcript['text'], prompts['action_items_prompt'], target_lang
+                    )
+
+            self._log("AI_PROCESSING", "Detecting participants...")
+            participants = self.ai.detect_participants(
+                transcript['text'], prompts['participant_detection_prompt']
+            )
+
+            # File Generation
+            self._log("FILE_GENERATION", "Creating output...")
+            folder = self.obsidian.create_folder(title, date_str)
+
+            meeting_data = {
+                'title': title,
+                'date': date_str,
+                'duration': int(duration),
+                'participants': participants,
+                'language': transcript.get('language', 'unknown'),
+                'overview': f"Processed from {Path(file_path).name}",
+                'processed_timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'original_filename': Path(file_path).name
+            }
+
+            transcript_data = {
+                'title': title,
+                'date': date_str,
+                'duration_formatted': f"{int(duration//60):02d}:{int(duration%60):02d}",
+                'formatted_transcript': formatted
+            }
+
+            # Build file contents
+            files = {'transcript': self.obsidian.generate_transcript(transcript_data)}
+
+            if self.template:
+                files['meta'] = self.obsidian.generate_meta(meeting_data, self.template['files'])
+                for key, config in self.template['files'].items():
+                    if config.get('enabled') and key in processed:
+                        content = processed[key]
+                        if 'template' in config:
+                            content = self.obsidian.generate_template_file(config, content, meeting_data)
+                        files[key] = content
+                self.obsidian.write_files(folder, files, self.template['files'])
+            else:
+                files['meta'] = self.obsidian.generate_meta(meeting_data)
+                files['summary'] = self.obsidian.generate_summary({
+                    'title': title,
+                    'date': date_str,
+                    'summary_content': processed.get('summary', ''),
+                    'speaker_stats': transcript.get('speaker_stats', {})
+                })
+                if processed.get('action_items'):
+                    files['action_items'] = self.obsidian.generate_action_items({
+                        'title': title,
+                        'date': date_str,
+                        'action_items_content': processed['action_items']
+                    })
+                self.obsidian.write_files(folder, files)
+
+            self._log("PIPELINE", f"Complete! Output: {folder}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Error processing transcript: {e}")
+            return False
