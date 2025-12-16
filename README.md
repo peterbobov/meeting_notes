@@ -78,17 +78,17 @@ uv run python main.py --monitor
 
 #### Option B: Manual Processing
 ```bash
-# Process a specific file
+# Process a specific file (speaker diarization enabled by default)
 uv run python main.py --file path/to/your/recording.mp3
 
 # Process with custom config
 uv run python main.py --file recording.mp3 --config custom_config.ini
 
-# Process with speaker identification
-uv run python main.py --file meeting.mp3 --speakers
+# Skip interactive speaker naming (use SPEAKER_00, SPEAKER_01, etc.)
+uv run python main.py --file meeting.mp3 --no-interactive
 
-# Process with speaker identification (skip interactive naming)
-uv run python main.py --file meeting.mp3 --speakers --no-interactive
+# Disable speaker identification (for self-recordings)
+uv run python main.py --file meeting.mp3 --no-speakers
 ```
 
 ### Step 4: Obsidian Integration
@@ -201,16 +201,19 @@ plaud_processor/
 ## 🛠️ Advanced Usage
 
 ### Speaker Diarization
-Enable speaker identification for multi-person meetings:
+Speaker identification is **enabled by default** for multi-person meetings:
 ```bash
-# Interactive speaker naming
-uv run python main.py --file meeting.mp3 --speakers
+# Default: interactive speaker naming
+uv run python main.py --file meeting.mp3
 
-# Skip interactive naming (use default Speaker A, B, C)
-uv run python main.py --file meeting.mp3 --speakers --no-interactive
+# Skip interactive naming (use SPEAKER_00, SPEAKER_01, etc.)
+uv run python main.py --file meeting.mp3 --no-interactive
+
+# Disable for self-recordings
+uv run python main.py --file meeting.mp3 --no-speakers
 
 # Combined with other features
-uv run python main.py --file meeting.mp3 --speakers --context "team standup" --verbose
+uv run python main.py --file meeting.mp3 --context "team standup" --verbose
 ```
 
 **Requirements:**
@@ -218,11 +221,40 @@ uv run python main.py --file meeting.mp3 --speakers --context "team standup" --v
 - Set `HUGGINGFACE_TOKEN` in .env file
 - Accept pyannote model license at https://huggingface.co/pyannote/speaker-diarization-3.1
 
+### Resume from Transcript
+Transcripts are automatically cached to `logs/transcripts/` after successful transcription. If processing fails later (e.g., during AI or file generation), resume without re-transcribing:
+```bash
+uv run python main.py --from-transcript logs/transcripts/audio_file_transcript.json --template default
+```
+
 ### Custom Prompts
 Edit `config.ini` to customize AI processing:
 - **summary_prompt**: Change summary format and focus
 - **action_items_prompt**: Modify action item extraction
 - **title_generation_prompt**: Customize meeting titles
+
+### Custom Templates
+Create JSON files in `templates/` to customize output. Example:
+```json
+{
+  "name": "Interview",
+  "description": "Interview processing",
+  "files": {
+    "summary": {
+      "enabled": true,
+      "filename": "3_interview_summary.md",
+      "prompt": "Summarize this interview by topic...",
+      "template": "# Summary - {title}\n\n**Date:** {date}\n\n{content}"
+    }
+  }
+}
+```
+
+**Template placeholders** - only these are supported in the `template` field:
+- `{title}` - Generated meeting title
+- `{date}` - Processing date (YYYY-MM-DD)
+- `{content}` - AI-generated content from the prompt
+- `{analysis_content}` - Same as `{content}` (alias)
 
 ### Batch Processing
 ```bash
@@ -319,9 +351,10 @@ uv run python main.py --file test.mp3
 uv run python main.py --file test.wav
 uv run python main.py --file test.m4a
 
-# Test speaker diarization
-uv run python main.py --file meeting.mp3 --speakers
-uv run python main.py --file meeting.mp3 --speakers --no-interactive
+# Test speaker diarization (enabled by default)
+uv run python main.py --file meeting.mp3
+uv run python main.py --file meeting.mp3 --no-interactive
+uv run python main.py --file meeting.mp3 --no-speakers
 
 # Test error handling
 uv run python main.py --file nonexistent.mp3  # Should handle gracefully
